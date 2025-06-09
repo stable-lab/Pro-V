@@ -1,0 +1,47 @@
+# Python version: 3.11.11
+
+# This project mainly uses Python standard libraries:
+# - json
+# - os
+# - shutil
+# - sys
+# - subprocess
+# - datetime
+# - pathlib
+# - ast
+# - typing
+# - argparse
+# - asyncio
+# - logging
+# - collections
+# - threading
+# - time
+# - functools
+# - itertools
+# - re
+# - random
+
+# Third-party library dependencies
+llama-index>=0.10.0  # For LLM integration
+pydantic>=2.0.0      # For data validation
+google-auth>=2.0.0   # For Google Cloud authentication
+google-cloud-aiplatform>=1.0.0  # For Vertex AI integration
+anthropic>=0.3.0     # For Anthropic API integration
+openai>=1.0.0        # For OpenAI API integration
+config>=0.5.1        # For configuration file management
+tiktoken>=0.5.0      # For token counting
+vertexai>=0.0.1      # For Vertex AI functionality
+rich>=13.0.0         # For beautifying log output
+cocotb>=1.8.0        # For hardware simulation and testing
+
+# Optional dependencies (for running tests)
+pytest>=7.0.0        # For running tests
+
+# LlamaIndex specific modules
+llama_index.llms.openai
+llama_index.llms.vertex
+llama_index.llms.anthropic
+llama_index.core
+
+# Additional dependencies
+idna

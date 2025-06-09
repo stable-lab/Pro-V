@@ -1,0 +1,71 @@
+#=========================================================================
+# Git Ignore Files
+#=========================================================================
+# We explicitly ignore a default build directory and the autoconf
+# generated autom4te.cache directory. This makes it easy to do a clean
+# build under the source directory and still have it appear clean to git.
+
+*.egg-info/
+*.vcd
+__pycache__/
+key.cfg
+wave.vcd
+output*/
+log*/
+data/
+ucsd-cse-stable-gcp-df6519e7cec2.json
+*.o
+*.d
+*.vvp
+dist/
+build/
+
+# Sensitive files - API keys and credentials
+*.json
+key.cfg
+*.key
+*.pem
+*.p12
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+output.log
+
+# Build artifacts
+obj_dir/
+*.o
+*.a
+*.so
+*.d
+*.mk
+
+# Temporary files
+*.tmp
+*.temp
+parser.out
+parsetab.py
+
