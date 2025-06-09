@@ -257,13 +257,12 @@ def main():
                         range(args.sampling_size),
                     )
                 
-                score_list={}
+                
                 
                 consistency_checker = ConsistencyChecker(args.model, args.max_token, args.provider, args.key_cfg_path, args.top_p, args.temperature, output_dir_per_task, task_number)
                 with open(f"{output_dir_per_task}/gen_python_code_list.txt", "r") as f:
                     gen_python_code_list=eval(f.read())
                 diff_gen_python_code_list=[]
-                diff_signal_list=[]
                 for idx in index_list:
                     diff_gen_python_code_list.append(gen_python_code_list[idx])
                     with open(f"{output_dir_per_task}/testbench_{idx}.json", "r") as f:
