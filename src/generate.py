@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 import utils.python_call as py
 from classify_circuit_type import CircuitTypeClassifier
-from gen_tb import TB_Generator
+from src.gen_stimuli import TB_Generator
 
 
 from check_consistency import ConsistencyChecker,ConsistencyChecker_with_signal
@@ -148,12 +148,26 @@ def main():
                 circuit_type_output_json_obj = circuit_type_classifier.run(input_spec)
                 circuit_type = circuit_type_output_json_obj["classification"]
            
-        if args.stage <= 1:
+        if args.stage <= 0:
             refined_input_spec = tb_extractor.run(input_spec)
             with open(f"{output_dir_per_task}/spec.txt", "w") as f:
                 f.write(refined_input_spec["revised_spec"])
             input_spec = refined_input_spec["revised_spec"]
             
+           
+                
+        if args.stage <= 1:
+            
+            
+            stimulus_result = tb_genarator.run(
+                        input_spec,
+                        header,
+                        circuit_type,
+                        stimuli_sampling_size=args.stimuli_sampling_size,
+                        
+                    )
+        
+            #print(f"stimulus_result: {stimulus_result}")
         if args.stage <= 2:
             gen_python_code_list=[]
             if circuit_type == "CMB":
@@ -185,20 +199,6 @@ def main():
                 gen_python_code_list.append(gen_python_code)
             with open(f"{output_dir_per_task}/gen_python_code_list.txt", "w") as f:
                 f.write(str(gen_python_code_list))
-                
-        if args.stage <= 2:
-            
-            
-            stimulus_result = tb_genarator.run(
-                        input_spec,
-                        header,
-                        circuit_type,
-                        stimuli_sampling_size=args.stimuli_sampling_size,
-                        
-                    )
-        
-            #print(f"stimulus_result: {stimulus_result}")
-        if args.stage <= 1:
 
             
             

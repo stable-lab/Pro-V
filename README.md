@@ -189,9 +189,10 @@ output_tb_gen_tb_<timestamp>/
 
 ### Multi-Stage Pipeline
 The system supports a multi-stage verification pipeline:
-- **Stage 0**: Full pipeline including spec refinement, circuit classification, and generation
-- **Stage 1**: Skip spec refinement
-- **Stage 2**: Skip spec refinement and circuit classification
+- **Stage 0**: Full pipeline including spec refinement, circuit classification, stimulus and python checker generation
+- **Stage 1**: Skip spec refinement and circuit classification
+- **Stage 2**: Skip spec refinement, circuit classification and stimuli generation.
+
 
 ### Circuit Type Support
 - **Combinational Circuits (CMB)**: Logic gates, multiplexers, encoders, etc.
