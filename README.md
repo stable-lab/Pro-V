@@ -36,8 +36,8 @@ The **primary entry point** and orchestrator of the entire verification flow:
 
 ### 1. Repository Installation
 ```bash
-git clone <repository-url>
-cd PRO-V
+git clone https://github.com/stable-lab/Pro-V.git
+cd src
 
 # Initialize submodules for benchmarks
 git submodule update --init --recursive
