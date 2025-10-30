@@ -2,12 +2,13 @@ import json
 from typing import Dict, List
 
 from llama_index.core.base.llms.types import ChatMessage, ChatResponse, MessageRole
-from gen_config import get_llm
-from log_utils import get_logger
-from prompts import ORDER_PROMPT
-from token_counter import TokenCounter, TokenCounterCached
+from utils.gen_config import get_llm
+from utils.log_utils import get_logger
+from utils.prompts import ORDER_PROMPT
+from utils.token_counter import TokenCounter, TokenCounterCached
 from pydantic import BaseModel
-
+import utils.python_call as py
+import os
 logger = get_logger(__name__)
 
 SYSTEM_PROMPT = """
@@ -404,46 +405,80 @@ class TB_Generator_SEQ:
         logger.info(f"Token count: {token_cnt}")
         logger.info(f"{resp.message.content}")
         return resp
-
     def run(
         self,
         input_spec: str,
         header: str,
-        tb_scenario_description: str,
         circuit_type: str = "SEQ",
+        stimuli_sampling_size: int = 3,
     ) -> str:
-        msg = [
-            ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM),
-            ChatMessage(
-                content=GENERATION_PROMPT.format(
-                    description=input_spec,
-                    module_header=header,
-                    example=ONE_SHOT_EXAMPLE,
-                    instruction=Instructions_for_Python_Code,
-                    test_case=tb_scenario_description,
+        stimulus_result=[]
+        for i in range(stimuli_sampling_size):
+            if circuit_type == "SEQ":
+                msg = [
+                    ChatMessage(content=SEQ_SYSTEM_PROMPT, role=MessageRole.SYSTEM),
+                    ChatMessage(
+                    content=SEQ_GENERATION_PROMPT.format(
+                        description=input_spec,
+                        module_header=header,
+                        example=SEQ_ONE_SHOT_EXAMPLE,
+                        instruction=SEQ_Instructions_for_Python_Code,
+                       
+                    ),
+                    role=MessageRole.USER,
                 ),
-                role=MessageRole.USER,
-            ),
-        ]
-        if circuit_type == "SEQ":
-            msg.append(ChatMessage(content=EXTRA_PROMPT_SEQ, role=MessageRole.USER))
-        msg.append(
-            ChatMessage(
-                content=ORDER_PROMPT.format(
-                    output_format="".join(json.dumps(EXAMPLE_OUTPUT, indent=4))
-                ),
-                role=MessageRole.USER,
+            ]
+            
+                msg.append(
+                    ChatMessage(
+                        content=ORDER_PROMPT.format(
+                            output_format="".join(json.dumps(SEQ_EXAMPLE_OUTPUT, indent=4))
+                        ),
+                        role=MessageRole.USER,
+                    )
+                )
+
+                response = self.generate(msg)
+            # Ensure necessary imports are added before generating code
+                stimulus_py_code = (
+                SEQ_python_code_header+ "\n" + self.parse_output(response).stimulus_gen_code + SEQ_tail
             )
-        )
+            
+            else:
+                msg = [
+                    ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM),
+                    ChatMessage(content=GENERATION_PROMPT.format(
+                        description=input_spec,
+                        module_header=header,   
+                        example=ONE_SHOT_EXAMPLE,
+                        instruction=Instructions_for_Python_Code
+                       
+                    ),
+                    role=MessageRole.USER,
+                ),
+            ]   
+                msg.append(
+                    ChatMessage(
+                        content=ORDER_PROMPT.format(
+                            output_format="".join(json.dumps(EXAMPLE_OUTPUT, indent=4))
+                        ),
+                        role=MessageRole.USER,
+                    )
+                )
+                response = self.generate(msg)
+            # Ensure necessary imports are added before generating code
+                stimulus_py_code = (
+                python_code_header+ "\n" + self.parse_output(response).stimulus_gen_code + tail
+            )
+            sampling_stimulus_python_path = self.stimulus_python_path
+            with open(sampling_stimulus_python_path, "w") as f:
+                f.write(stimulus_py_code)
+            stimulus_result = py.python_call_and_save(
+                f"{sampling_stimulus_python_path}", silent=True
+            )
+            with open(sampling_stimulus_python_path.replace(".py", ".json"), "r") as f:
+                stimulus_result.append(json.load(f))
+            os.remove(sampling_stimulus_python_path)
 
-        response = self.generate(msg)
-        # Ensure necessary imports are added before generating code
-        stimulus_py_code = (
-            python_code_header + self.parse_output(response).stimulus_gen_code + tail
-        )
-
-        with open(self.stimulus_python_path, "w") as f:
-            f.write(stimulus_py_code)
-
-        logger.info(f"Get response from {self.model}: {response}")
-        return stimulus_py_code
+            logger.info(f"Get response from {self.model}: {response}")
+        return stimulus_result

@@ -1,0 +1,18 @@
+{{- '<|im_start|>system\n' -}}
+{%- if messages[0].role == 'system' -%}
+{{- messages[0].content + '\n' -}}
+{%- set loop_messages = messages[1:] -%}
+{%- else -%}
+{%- set loop_messages = messages -%}
+{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- for message in loop_messages -%}
+{%- if message.role == 'user' -%}
+{{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' -}}
+{%- elif message.role == 'assistant' -%}
+{{- '<|im_start|>assistant\n' + message.content + '<|im_end|>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' -}}
+{%- endif -%}

@@ -9,65 +9,41 @@ import json
 from typing import Dict
 
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
-from mage.gen_config import get_llm
-from mage.log_utils import get_logger
-from mage.prompts import ORDER_PROMPT
-from mage.token_counter import TokenCounter, TokenCounterCached
-from mage.gen_config import Config
-from mage.log_utils import get_logger, set_log_dir, switch_log_to_file
+from utils.gen_config import get_llm
+from utils.log_utils import get_logger
+from utils.prompts import ORDER_PROMPT
+from utils.token_counter import TokenCounter, TokenCounterCached
+from utils.gen_config import Config
+from utils.log_utils import get_logger, set_log_dir, switch_log_to_file
 logger = get_logger(__name__)
 
 SYSTEM_PROMPT = """
-You are an expert in RTL design and verification.
+You are an expert in Python code design.
 """
 INIT_EDITION_PROMPT = """
 
-Your task is to review a natural-language RTL specification and input/output signal data (in JSON format) for a combinational circuit.
- "scenario": "scenarioNameNoPunctuation",
-  "input variable": \[
-    {{
-      "input_variable_name1": "binary_value_1", // input_variable_name1: binary value for this input signal
-      "input_variable_name2": "binary_value_2",
-      "input_variable_name3": "binary_value_3"
-    }}\]
-  "output variable": \[
-    {{
-      "output_variable_name1": "binary_value_1", // output_variable_name1: binary value that should appear immediately in response to inputs
-      "output_variable_name2": "binary_value_2",
-      "output_variable_name3": "binary_value_3"
-    }}\]
+Your task is to review a natural-language problem description, some python code list(index begin from 0) designed to solve the problem , their result is different, please review the python code and the result, and choose the best python code. Important: even  the best python code is still likely to fail to meet the exact requirements of the problem description, you should also judge if the best python code is matched with the specification.
 
-You must think step by step to determine whether the observed input/output behavior matches the expected logic described in the RTL specification for this combinational circuit.
-Firstly, think about the core functionality scenarios that test the main logical operations of the combinational circuit.
-Secondly, analyze the relationship between inputs and outputs:
-1. Examine each input combination and its corresponding output.
-2. Verify that outputs change immediately and only in response to input changes (no timing dependencies).
-3. Check that the same input combinations always produce the same outputs (combinational behavior).
-4. Verify that outputs do not depend on any previous input states.
-5. Check if the logical operations specified in the RTL are correctly implemented.
-If there are mismatches, identify them and propose or describe the needed actions to resolve them (or highlight the issues).
+You must think step by step to determine whether the python code and the observed input/output behavior matches the expected logic described in the problem description.
 
-The following information is provided to assist your work:
-1. RTL specification: A natural-language RTL specification describing the expected combinational logic behavior.
-2. imperfect_output: Input/output signal data (in JSON format) might or might not match the specification showing various input combinations and their corresponding outputs.
 
-<RTL specification>
+<problem_description>
 {spec}
-</RTL specification>
+</problem_description>
 
-<module_header>
-{module_header}
-</module_header>
 
-<imperfect_output>
-{testbench}
-</imperfect_output>
+
+<python_code_list>
+{python_code_list}
+</python_code_list>
+
+
 
 [Task]:
-1. **Interpret the RTL specification** and understand the intended combinational logic. 
+1. **Interpret the problem description** and understand the intended combinational logic. 
 To complete this task, follow these steps:
 
-1. Analyze the RTL specification:
+1. Analyze the problem description:
    - Identify the key logical operations and expected behavior
    - Determine the expected input/output relationships
    - Note any specific logical constraints or requirements
@@ -191,29 +167,13 @@ As a reminder, please directly provide the content without adding any extra comm
 
 EXAMPLE_OUTPUT_FORMAT = {
     "reasoning": "All reasoning steps, think step by step which scenario is most significant to the functionality of the design",
-    "functionality_reasoning": "Reasoning if the functionality of the json file matches the specification",
-    "edge_reasoning": "Reasoning if the edge cases of the json file matches the specification",
-    "result": [
-        {
-            "name": "key scenario1",
-            "input/output_variable_correlations": "the correlations between input and output variables",
-            "explanation": "Here's why it matches or does not match.",
-            "if_matches": "yes/no",
-            "input_variable": "the input in the testbench.json that in the scenario does not match the specification",
-            "unmatched_present_output": "the present output in the testbench.json that does not match the specification",
-            'correct_output': "the correct output that should be in the testbench.json",
-        },
-        {
-            "name": "key scenario2",
-            "input/output_variable_correlations": "the correlations between input and output variables",
-            "explanation": "Here's why it matches or does not match.",
-            "if_matches": "yes/no",
-            "input_variable": "the input in the testbench.json that in the scenario does not match the specification",
-            "unmatched_present_output": "the present output in the testbench.json that does not match the specification",
-            'correct_output': "the correct output that should be in the testbench.json",
-        },
-        
-    ],
+    "reasoning_for_candidate_python_0":"the reasoning for if the first candidate python code aligns with the specification",
+    "reasoning_for_candidate_python_1":"the reasoning for if the second candidate python code aligns with the specification",
+    "reasoning_for_candidate_python_2":"the reasoning for if the third candidate python code aligns with the specification",
+    "best_python_code": "int, 0/1/2/3/4/5,the best python code index ",
+    "if_matches": "yes or no, if the best python code is perfectly matched with the specification",
+    "reason_for_best_python_code_mismatch":"the reason for the best python code mismatch with the specification, if if_matches is yes, this field is empty",
+    
 }
 
 ACTION_OUTPUT_PROMPT = r"""
@@ -224,51 +184,6 @@ Output after running given action:
 """
 
 example = """
-<spec>
-Consider the state machine shown below:
-
-// A (0) --0--> B
-// A (0) --1--> A
-// B (0) --0--> C
-// B (0) --1--> D
-// C (0) --0--> E
-// C (0) --1--> D
-// D (0) --0--> F
-// D (0) --1--> A
-// E (1) --0--> E
-// E (1) --1--> D
-// F (1) --0--> C
-// F (1) --1--> D
-
-// Assume that you want to Implement the FSM using three flip-flops and state codes y[3:1] = 000, 001, ..., 101 for states A, B, ..., F, respectively. Implement just the next-state logic for y[2] in Verilog. The output Y2 is y[2].
-</spec>
-
-<imperfect_output>
-  {
-    "scenario": "FromStateB_Transitions0",
-    "input variable": [
-      {
-        "y": "001",
-        "w": "0"
-      }
-    ],
-    "output variable": [
-      {
-        "Y2": "0"
-      }
-    ]
-  }
-</imperfect_output>
-<reasoning>
-When y=001 and w=0, the next state should be D(100). The expected output is 1, but the imperfect output is 0.
-</reasoning>
-<result>
-{
-    "name": "FromStateB_Transitions0",
-    "input/output_variable_correlations": "Y2 is the middle bit of the next state",
-    "explanation": "Here's why it matches or does not match.",
-    "if_matches": "no",
-}
 """
 
 
@@ -299,22 +214,9 @@ class ConsistencyChecker:
             if TokenCounterCached.is_cache_enabled(self.llm)
             else TokenCounter(self.llm)
         )
-        self.exp_dir = Path(exp_dir+f"/{task_numbers}")
+        self.exp_dir = exp_dir
 
-    def get_init_prompt_messages(self) -> List[ChatMessage]:
-        """Generate initial prompt messages."""
-        system_prompt = ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM)
 
-        spec, scenario, testbench,module_header = self.load_input_files()
-
-        init_prompt = ChatMessage(
-            content=INIT_EDITION_PROMPT.format(
-                spec=spec, scenario_discription=scenario, testbench=testbench,example=example,module_header=module_header
-            ),
-            role=MessageRole.USER,
-        )
-
-        return [system_prompt, init_prompt]
 
     def get_order_prompt_messages(self) -> List[ChatMessage]:
         """Generate order prompt messages."""
@@ -332,38 +234,44 @@ class ConsistencyChecker:
 
     def load_input_files(self) -> Tuple[str, str, str]:
         """Load the spec, scenario description and testbench files."""
-        with open(self.exp_dir / "spec.txt", "r") as f:
+        with open(f"{self.exp_dir}/spec.txt", "r") as f:
             spec = f.read()
 
-        with open(self.exp_dir / "TB_scenarios.txt", "r") as f:
-            scenario = f.read()
-
-        with open(self.exp_dir / "testbench.json", "r") as f:
-            testbench = f.read()
-        
-        with open(self.exp_dir / "module_header.txt", "r") as f:
+      
+        with open(f"{self.exp_dir}/module_header.txt", "r") as f:
             module_header = f.read()
+        
+        return spec, module_header
 
-        return spec, scenario, testbench,module_header
-
-    def run(self) -> bool:
+    def run(self,python_code_list:List[str]) -> bool:
         """
         Main function to check consistency and fix implementation if needed.
         Returns True if all scenarios match after potential fixes.
         """
         """Single chat interaction to check consistency."""
         #spec, scenario, testbench = self.load_input_files()
+        
         if isinstance(self.token_counter, TokenCounterCached):
             self.token_counter.set_enable_cache(True)
         self.token_counter.set_cur_tag(self.__class__.__name__)
+        system_prompt = ChatMessage(content=SYSTEM_PROMPT, role=MessageRole.SYSTEM)
+
+        spec,module_header = self.load_input_files()
+
+        init_prompt = ChatMessage(
+            content=INIT_EDITION_PROMPT.format(
+                spec=spec,  python_code_list=python_code_list,example=example,module_header=module_header
+            ),
+            role=MessageRole.USER,
+        )
 
         # Generate response
-        messages = self.get_init_prompt_messages() + self.get_order_prompt_messages()
+        messages = [system_prompt, init_prompt] + self.get_order_prompt_messages()
         logger.info(f"Consistency checker input message: {messages}")
         resp, token_cnt = self.token_counter.count_chat(messages)
         logger.info(f"Token count: {token_cnt}")
         logger.info(f"Response: {resp.message.content}")
-        note=""
+        
         #response_content = resp.message.content
         try:
                 # output_json_obj: Dict = json.loads(response.message.content, strict=False)
@@ -374,36 +282,24 @@ class ConsistencyChecker:
                 # else:
                 #     output_json_obj: Dict = json.loads(response.choices[0].message.content, strict=False)
                 output_json_obj: Dict = json.loads(resp.message.content, strict=False)
-                unmatch_case=0
-
-                print(output_json_obj)
-                for data in output_json_obj["result"]:
-                    if data["if_matches"] == "no":
-                        note+= f"The case {data['name']} does not match the specification\n"
-                        note+=f'the reasoning is {data["explanation"]}\n'
-                        note+=f'the input variable is {data["input_variable"]}\n'
-                        note+= f"The present output is {data['unmatched_present_output']}\n"
-                        note+= f"The correct output is {data['correct_output']}\n"
-                        unmatch_case+=1
-                if unmatch_case>0:
-                    logger.error(f"There are {unmatch_case} unmatch cases")
+                with open(f"{self.exp_dir}/judge_1.txt", "w") as f:
+                    f.write(resp.message.content)
+                print(f"output_json_obj: {output_json_obj}")
+                best_python_code_index=int(output_json_obj['best_python_code'])
+                if_matches=True if output_json_obj['if_matches']=='yes' else False
                 
-                else:
-                    logger.info(f"All cases match the specification")
+                return best_python_code_index,if_matches,output_json_obj['reason_for_best_python_code_mismatch']
         except json.decoder.JSONDecodeError as e:
-                    print(f"Json parse error: {e}")
-                    logger.info(f"Json parse error: {e}")
-                    print(resp)
-                    return None
-        print(f"the unmatch case is {unmatch_case}")
-        with open(self.exp_dir / "output.txt", "w") as f:
-                    f.write(note)
+            logger.error(f"Json parse error: {e}")
+            logger.error(f"Response: {resp.message.content}")
+            return None,None
+
 
             # Run consistency check again with new implementation
             # Note: You might want to implement a mechanism to use the new file
             # return check_and_fix_implementation(exp_dir, token_counter)
 
-        return unmatch_case
+        return best_python_code_index,if_matches
 
 
 

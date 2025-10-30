@@ -1,0 +1,109 @@
+# Python
+*.pid
+*.ipynb
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+*_venv/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs and Outputs
+logs/
+outputs/
+log_*/
+output_*/
+*.log
+
+# API Keys and Secrets
+key.cfg
+*.key
+.env
+secrets/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# Verilog/SystemVerilog Simulation
+*.vcd
+*.fsdb
+*.log
+*.out
+*.o
+*.vpd
+*.key
+*.ver
+obj_dir/
+simv*
+csrc/
+DVEfiles/
+ucli.key
+
+# Parser files
+parser.out
+parsetab.py
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.cache/
+
+# Build artifacts
+autom4te.cache/
+
+# Test outputs
+success_list.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+

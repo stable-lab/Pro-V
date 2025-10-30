@@ -2,10 +2,10 @@ import json
 from typing import Dict
 
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
-from mage.gen_config import get_llm
-from mage.log_utils import get_logger
-from mage.prompts import ORDER_PROMPT
-from mage.token_counter import TokenCounter, TokenCounterCached
+from utils.gen_config import get_llm
+from utils.log_utils import get_logger
+from utils.prompts import ORDER_PROMPT
+from utils.token_counter import TokenCounter, TokenCounterCached
 
 logger = get_logger(__name__)
 

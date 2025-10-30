@@ -1,0 +1,49 @@
+# Build tools
+setuptools>=77.0.3,<81
+
+# Core LLM Libraries
+anthropic>=0.34.0
+openai>=1.0.0
+tiktoken>=0.5.0
+
+# LlamaIndex - using prebuilt wheels
+llama-index-core>=0.10.0,<0.15.0
+llama-index-llms-anthropic>=0.1.0
+llama-index-llms-openai>=0.1.0
+llama-index-llms-openai-like>=0.1.0
+llama-index-llms-vertex>=0.1.0
+llama-index>=0.10.0
+
+# Google Cloud dependencies (for Vertex AI)
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-cloud-aiplatform>=1.38.0
+
+# Data Validation and Serialization
+pydantic>=2.0.0,<3.0.0
+
+# Configuration Management
+configparser>=5.0.0
+config>=0.5.1
+# Verilog/HDL Processing
+jinja2>=3.1.0
+ply>=3.11
+
+# Testing and Verification
+cocotb>=1.8.0
+
+# Logging and CLI
+rich>=13.0.0
+tqdm>=4.60.0
+
+# Standard Utilities
+python-dateutil>=2.8.0
+
+# Distributed Computing and LLM Serving
+ray[default]>=2.0.0
+vllm>=0.10.2
+
+# If vLLM installation fails with OpenSSL errors, you can either:
+# 1. Use conda to install openssl: conda install openssl
+# 2. Set environment variable: export OPENSSL_DIR=/path/to/openssl
+# 3. Or install prebuilt wheels: pip install vllm --no-build-isolation
