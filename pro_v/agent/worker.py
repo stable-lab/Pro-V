@@ -5,23 +5,18 @@ This module contains Ray worker implementations for parallel Verilog simulation
 with proper timeout handling and resource management.
 """
 
-import os
-import json
 import asyncio
+import json
+import logging
+import os
+import re
+import shutil
 import signal
 import subprocess
-import shutil
 import tempfile
 import time
-import re
-from typing import Any, List, Tuple, Dict
-import logging
-from pro_v.tools.pychecker_utils import check_compile_success, check_simulation_pass
-
-# Default simulation timeouts (overridable via environment variables)
-# Increased from 300s to 600s to handle complex simulations
-SEQ_SIM_TIMEOUT = int(os.getenv("PYCHECKER_SEQ_SIM_TIMEOUT", "600"))
-CMB_SIM_TIMEOUT = int(os.getenv("PYCHECKER_CMB_SIM_TIMEOUT", "600"))
+from typing import Any, Dict, List, Tuple
+from pro_v.agent.utils import check_compile_success, check_simulation_pass
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -32,6 +27,10 @@ console.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 console.setFormatter(formatter)
 logger.addHandler(console)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SIM_SEQ_TEMPLATE_DIR = os.path.join(BASE_DIR, "sim_seq")
+SIM_CMB_TEMPLATE_DIR = os.path.join(BASE_DIR, "sim_cmb")
 
 try:
     import ray
@@ -45,7 +44,7 @@ _RAY_TASK_HANDLE = None
 _RAY_PYCHECKER_ACTOR_POOL: List[Any] | None = None
 
 
-async def _await_ray_object_ref(obj_ref, timeout_seconds: float = 900.0):
+async def _await_ray_object_ref(obj_ref, timeout_seconds: float = 120.0):
     """
     Await a Ray object reference with timeout.
     
@@ -81,18 +80,61 @@ async def _await_ray_object_ref(obj_ref, timeout_seconds: float = 900.0):
 def _ensure_ray_initialized() -> None:
     """
     Ensure Ray is initialized with proper configuration.
-    
-    Initializes Ray if not already running, with custom temp directories
-    and resource configurations from environment variables.
+
+    First tries to connect to an existing Ray cluster (started by shell script),
+    and falls back to initializing a new cluster if needed.
     """
     if not RAY_AVAILABLE:
         raise RuntimeError("Ray is not available")
-        
-    import ray  
+
+    import ray
 
     if ray.is_initialized():
+        logger.info("Ray already initialized")
         return
-    
+
+    # Try to connect to existing Ray cluster first
+    try:
+        logger.info("Attempting to connect to existing Ray cluster...")
+        ray.init(
+            address='auto',
+            ignore_reinit_error=True
+        )
+        logger.info("✅ Connected to existing Ray cluster successfully")
+
+        # Log Ray cluster resources
+        resources = ray.available_resources()
+        logger.info(f"Ray cluster resources: CPU={resources.get('CPU', 0)}, "
+                   f"memory={resources.get('memory', 0) / 1e9:.2f}GB")
+        return
+    except Exception as e:
+        logger.warning(f"Could not connect to existing Ray cluster: {e}")
+        logger.info("Will try to initialize a new Ray cluster...")
+
+    # Fallback: Initialize new Ray cluster
+    # Clean up old Ray sessions to prevent GCS overload
+    ray_tmp_dir = "/tmp/verl_ray"
+    ray_spill_dir = "/tmp/verl_spill"
+
+    logger.info("Cleaning up old Ray sessions...")
+    try:
+        # Remove old session directories
+        if os.path.exists(ray_tmp_dir):
+            for item in os.listdir(ray_tmp_dir):
+                if item.startswith("session_"):
+                    session_path = os.path.join(ray_tmp_dir, item)
+                    shutil.rmtree(session_path, ignore_errors=True)
+
+        # Clean spill directory
+        if os.path.exists(ray_spill_dir):
+            shutil.rmtree(ray_spill_dir, ignore_errors=True)
+
+        logger.info("Old Ray sessions cleaned up")
+    except Exception as e:
+        logger.warning(f"Failed to clean up old sessions: {e}")
+
+    os.makedirs(ray_tmp_dir, exist_ok=True)
+    os.makedirs(ray_spill_dir, exist_ok=True)
 
     init_kwargs = {
         "ignore_reinit_error": True,
@@ -100,55 +142,52 @@ def _ensure_ray_initialized() -> None:
         "logging_level": "ERROR",
     }
 
+    # Configure num_cpus - default to physical cores if not specified
     num_cpus_env = os.getenv("RAY_NUM_CPUS")
     if num_cpus_env:
         try:
             num_cpus = float(num_cpus_env)
             if num_cpus > 0:
                 init_kwargs["num_cpus"] = num_cpus
+                logger.info(f"Setting Ray num_cpus to {num_cpus}")
             else:
-                print(f"Warning: RAY_NUM_CPUS must be positive, got {num_cpus_env}")
+                logger.warning(f"RAY_NUM_CPUS must be positive, got {num_cpus_env}")
         except (ValueError, TypeError):
-            print(f"Warning: invalid RAY_NUM_CPUS value: {num_cpus_env}, using default")
+            logger.warning(f"Invalid RAY_NUM_CPUS value: {num_cpus_env}, using default")
 
-    ray_tmp_dir = "/tmp/verl_ray"
-    ray_spill_dir = "/tmp/verl_spill"
-    os.makedirs(ray_tmp_dir, exist_ok=True)
-    os.makedirs(ray_spill_dir, exist_ok=True)
-    
-    init_kwargs["_temp_dir"] = ray_tmp_dir
-    spilling_conf = {"type": "filesystem", "params": {"directory_path": [ray_spill_dir]}}
-    init_kwargs["_system_config"] = {
-        "object_spilling_config": json.dumps(spilling_conf)
-    }
-    
     try:
+        logger.info("Initializing new Ray cluster in distributed mode...")
         ray.init(**init_kwargs)
-    except ValueError as e:
-        if "_system_config must not be provided" in str(e):
-            print("Detected existing Ray cluster, reconnecting without _system_config...")
-            init_kwargs.pop("_system_config", None)
-            init_kwargs.pop("_temp_dir", None)
-            ray.init(**init_kwargs)
-        else:
-            raise
+        logger.info("✅ Ray initialized successfully in distributed mode")
+
+        # Log Ray cluster resources
+        resources = ray.available_resources()
+        logger.info(f"Ray cluster resources: CPU={resources.get('CPU', 0)}, "
+                   f"memory={resources.get('memory', 0) / 1e9:.2f}GB")
+    except Exception as init_error:
+        logger.error("❌ Ray initialization failed: %s", init_error)
+        logger.error("Please check your Ray configuration and resources")
+        raise RuntimeError(
+            f"Ray initialization failed. This is required for parallel worker execution. "
+            f"Error: {init_error}"
+        ) from init_error
 
 def get_ray_pychecker_worker_cls(num_workers=None):
     """
     Get or create the Ray PyChecker worker class.
-    
+
     Returns a Ray remote actor class that can execute PyChecker simulations
     with timeout handling. Uses caching to avoid recreating the class.
-    
+
     Args:
-        num_workers: Number of workers (for compatibility, not used in this implementation)
-    
+        num_workers: Expected number of workers to create (used for auto CPU calculation)
+
     Returns:
         Ray remote actor class for PyChecker simulation execution
     """
     if not RAY_AVAILABLE:
         return None
-        
+
     _ensure_ray_initialized()
 
     if hasattr(get_ray_pychecker_worker_cls, "_cls"):
@@ -158,22 +197,40 @@ def get_ray_pychecker_worker_cls(num_workers=None):
     # Key insight: Different tasks use different workers (assigned randomly in execution engine)
     # So we need many workers running in parallel, each handling one compilation task
     #
-    # For 200+ CPUs and 400-500 tasks:
-    # - Lower num_cpus allows more concurrent workers
-    # - Each worker handles ONE task at a time (max_concurrency=1)
-    # - Example: 0.5 CPU/worker * 400 workers = 200 CPUs (better utilization)
-    # - Increased from 0.4 to 0.5 for better resource allocation granularity
-    num_cpus_per_worker = float(os.getenv("PYCHECKER_WORKER_CPUS", "0.5"))
+    # Auto-calculate num_cpus_per_worker based on available CPUs and desired workers
+    # Formula: num_cpus_per_worker = total_cpus / num_workers
+    # This ensures we can actually create all requested workers
+
+    # Get total available CPUs from Ray
+    import ray
+    total_cpus = ray.available_resources().get("CPU", os.cpu_count())
+
+    # Allow environment variable override, but use auto-calculation by default
+    if "PYCHECKER_WORKER_CPUS" in os.environ:
+        num_cpus_per_worker = float(os.getenv("PYCHECKER_WORKER_CPUS"))
+        logger.info(f"Using PYCHECKER_WORKER_CPUS from environment: {num_cpus_per_worker}")
+    elif num_workers is not None and num_workers > 0:
+        # Auto-calculate: divide total CPUs by desired workers
+        # Add small buffer (0.9) to avoid over-subscription
+        num_cpus_per_worker = (total_cpus * 0.9) / num_workers
+        # Clamp to reasonable range [0.1, 2.0]
+        num_cpus_per_worker = max(0.1, min(2.0, num_cpus_per_worker))
+        logger.info(f"Auto-calculated num_cpus_per_worker: {num_cpus_per_worker:.2f} (total_cpus={total_cpus}, num_workers={num_workers})")
+    else:
+        # Fallback to default
+        num_cpus_per_worker = 0.4
+        logger.warning(f"Using default num_cpus_per_worker: {num_cpus_per_worker} (num_workers not provided)")
+
     max_concurrent_tasks = int(os.getenv("PYCHECKER_WORKER_CONCURRENCY", "1"))
-    
-    logger.info(f"Creating PyChecker worker class with num_cpus={num_cpus_per_worker}, max_concurrency={max_concurrent_tasks}")
+
+    logger.info(f"Creating PyChecker worker class with num_cpus={num_cpus_per_worker:.2f}, max_concurrency={max_concurrent_tasks}")
     
     @ray.remote(num_cpus=num_cpus_per_worker, max_concurrency=max_concurrent_tasks)
     class _RayPyCheckerWorker:
         def __init__(self, idx=None, worker_id=None, num_jobs=1, timeout=300):
             # Support both idx (legacy) and worker_id (new) parameters
             if worker_id is not None:
-                self.idx = int(worker_id) if isinstance(worker_id, (int, float, str)) else 0
+                self.idx = int(worker_id)
             elif idx is not None:
                 if isinstance(idx, (int, float)):
                     self.idx = int(idx)
@@ -183,14 +240,15 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                     self.idx = 0
             else:
                 self.idx = 0
-            
+
+            self.num_jobs = num_jobs
             self.timeout = timeout
 
         def get_idx(self):
             """Get the actor's index"""
             return self.idx
 
-        async def run_python_file(
+        def run_python_file(
             self,
             python_file_path: str,
             working_directory: str,
@@ -221,7 +279,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
 
         
 
-        async def simulate_dut_seq_ray(self, output_dir: str) -> Tuple[int, str, str, float]:
+        def simulate_dut_seq_ray(self, output_dir: str) -> Tuple[int, str, str, float]:
             """
             Ray remote function: Execute sequential circuit simulation in separate process
             
@@ -232,8 +290,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 (returncode, stdout, stderr, reward) tuple
             """
             
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            sim_template_dir = os.path.join(os.path.dirname(current_dir), "sim_seq")
+            sim_template_dir = SIM_SEQ_TEMPLATE_DIR
             
             work_dir = os.path.join(output_dir, f"sim_seq")
             
@@ -276,20 +333,12 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             make_jobs = os.getenv("PYCHECKER_MAKE_JOBS", "1")
             cmd = f"cd {work_dir} && python harness-generator.py && make -j{make_jobs}"
             try:
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=SEQ_SIM_TIMEOUT
-                )
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
             except subprocess.TimeoutExpired:
-                logger.error(f"SEQ simulation timeout after {SEQ_SIM_TIMEOUT}s for {output_dir}")
+                print(f"SEQ simulation timeout after 60s for {output_dir}")
                 result = subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=1,
-                    stdout="",
-                    stderr=f"Simulation timeout after {SEQ_SIM_TIMEOUT} seconds"
+                    args=cmd, returncode=1, 
+                    stdout="", stderr="Simulation timeout after 60 seconds"
                 )
             
             # Save log
@@ -316,7 +365,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             return result.returncode, result.stdout, result.stderr, reward
 
 
-        async def simulate_dut_cmb_ray(self, output_dir: str) -> Tuple[int, str, str, float]:
+        def simulate_dut_cmb_ray(self, output_dir: str) -> Tuple[int, str, str, float]:
             """
             Ray remote function: Execute combinational circuit simulation in separate process
             
@@ -326,8 +375,8 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             Returns:
                 (returncode, stdout, stderr, reward) tuple
             """
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            sim_template_dir = os.path.join(os.path.dirname(current_dir), "sim_cmb")
+            #current_dir = os.path.dirname(os.path.abspath(__file__))
+            sim_template_dir = SIM_CMB_TEMPLATE_DIR
             
             #task_id = os.path.basename(os.path.normpath(output_dir))
             work_dir = os.path.join(output_dir, f"sim_cmb")
@@ -371,20 +420,12 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             make_jobs = os.getenv("PYCHECKER_MAKE_JOBS", "1")
             cmd = f"cd {work_dir} && python harness-generator.py && make -j{make_jobs}"
             try:
-                result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=CMB_SIM_TIMEOUT
-                )
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
             except subprocess.TimeoutExpired:
-                logger.error(f"CMB simulation timeout after {CMB_SIM_TIMEOUT}s for {output_dir}")
+                logger.error(f"CMB simulation timeout after 180s for {output_dir}")
                 result = subprocess.CompletedProcess(
-                    args=cmd,
-                    returncode=1,
-                    stdout="",
-                    stderr=f"Simulation timeout after {CMB_SIM_TIMEOUT} seconds"
+                    args=cmd, returncode=1, 
+                    stdout="", stderr="Simulation timeout after 180 seconds"
                 )
 
             # Save log
@@ -406,10 +447,12 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 reward = 0.3
                 if check_simulation_pass(log_content):
                     reward = 1.0
+
+       
             
             return result.returncode, result.stdout, result.stderr, reward
 
-        async def run_verilog_simulation(
+        def run_verilog_simulation(
             self,
             task_folder: str,
             circuit_type: str,
@@ -417,12 +460,12 @@ def get_ray_pychecker_worker_cls(num_workers=None):
         ) -> Tuple[bool, str, Dict[str, Any]]:
             """
             Execute Verilog simulation and return result with reward.
-            
+
             Args:
                 task_folder: Task folder containing all artifacts
                 circuit_type: "CMB" or "SEQ"
                 timeout: Execution timeout
-                
+
             Returns:
                 (success, error_message, results_dict) tuple
             """
@@ -432,12 +475,12 @@ def get_ray_pychecker_worker_cls(num_workers=None):
 
                 # Call appropriate simulation function based on circuit type
                 if normalized_type == "SEQ":
-                    returncode, stdout, stderr, reward = await self.simulate_dut_seq_ray(task_folder)
+                    returncode, stdout, stderr, reward = self.simulate_dut_seq_ray(task_folder)
                 elif normalized_type == "CMB":
-                    returncode, stdout, stderr, reward = await self.simulate_dut_cmb_ray(task_folder)
+                    returncode, stdout, stderr, reward = self.simulate_dut_cmb_ray(task_folder)
                 else:
                     raise ValueError(f"Unsupported circuit type: {circuit_type}")
-                
+
                 # Prepare results dictionary
                 results_dict = {
                     'returncode': returncode,
@@ -447,13 +490,13 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                     'compile_success': reward >= 0.3,
                     'all_tests_passed': reward >= 1.0
                 }
-                
+
                 if returncode == 0:
                     return True, "", results_dict
                 else:
                     error_msg = f"Simulation failed with return code {returncode}: {stderr}"
                     return False, error_msg, results_dict
-                    
+
             except Exception as e:
                 error_msg = f"Verilog simulation error: {str(e)}"
                 results_dict = {
@@ -466,7 +509,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 }
                 return False, error_msg, results_dict
 
-        async def run_stimulus_generation(
+        def run_stimulus_generation(
             self,
             stimulus_py_path: str,
             task_folder: str,
@@ -475,13 +518,13 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             try:
                 # Ensure task_folder exists before using it as cwd
                 os.makedirs(task_folder, exist_ok=True)
-
+                
                 # Normalize task_folder to absolute path
                 task_folder = os.path.abspath(task_folder)
-
+                
                 # Resolve stimulus_py_path
                 basename = os.path.basename(stimulus_py_path)
-
+                
                 if os.path.isabs(stimulus_py_path):
                     # Already absolute, normalize it
                     stimulus_py_path_abs = os.path.abspath(stimulus_py_path)
@@ -499,11 +542,11 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                     else:
                         # Join with task_folder and normalize
                         stimulus_py_path_abs = os.path.abspath(os.path.join(task_folder, stimulus_py_path))
-
+                
                 # Check if file exists
                 if not os.path.exists(stimulus_py_path_abs):
                     return False, f"Stimulus file not found: {stimulus_py_path_abs} (original path: {stimulus_py_path}, task_folder: {task_folder})"
-
+                
                 # If stimulus_py_path is in task_folder, use relative path
                 # Otherwise use absolute path
                 try:
@@ -515,7 +558,7 @@ def get_ray_pychecker_worker_cls(num_workers=None):
                 except ValueError:
                     # If paths are on different drives (Windows), use absolute path
                     script_path = stimulus_py_path_abs
-
+                
                 # Execute stimulus generation script
                 result = subprocess.run(
                     ["python", script_path],
@@ -534,216 +577,16 @@ def get_ray_pychecker_worker_cls(num_workers=None):
             except Exception as e:
                 return False, f"Stimulus execution error: {str(e)}"
 
-        async def run_iverilog_test(
-            self,
-            rtl_code: str,
-            testbench_code: str,
-            timeout: float = 30.0
-        ) -> Tuple[bool, str, Dict[str, Any]]:
-            """
-            Test RTL code using iverilog with a given testbench.
-
-            Args:
-                rtl_code: Verilog RTL code to test
-                testbench_code: Testbench code (including reference module and stimulus)
-                timeout: Execution timeout in seconds
-
-            Returns:
-                (success, error_message, results_dict) tuple
-                results_dict contains:
-                    - compile_success: bool
-                    - simulation_success: bool
-                    - mismatch_count: int
-                    - total_samples: int
-                    - stdout: str
-                    - stderr: str
-            """
-            work_dir = None
-            try:
-                # Create temporary working directory
-                work_dir = tempfile.mkdtemp(prefix="iverilog_test_")
-
-                # Write RTL code to file
-                rtl_path = os.path.join(work_dir, "top_module.v")
-                with open(rtl_path, 'w') as f:
-                    f.write(rtl_code)
-
-                # Write testbench to file
-                tb_path = os.path.join(work_dir, "testbench.v")
-                with open(tb_path, 'w') as f:
-                    f.write(testbench_code)
-
-                # Compile with iverilog
-                compile_cmd = ["iverilog", "-g2012", "-o", "test.vvp", "testbench.v", "top_module.v"]
-                logger.debug(f"Compiling with: {' '.join(compile_cmd)}")
-
-                compile_result = subprocess.run(
-                    compile_cmd,
-                    cwd=work_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout / 2
-                )
-
-                results_dict = {
-                    'compile_success': False,
-                    'simulation_success': False,
-                    'mismatch_count': -1,
-                    'total_samples': -1,
-                    'compile_stdout': compile_result.stdout,
-                    'compile_stderr': compile_result.stderr,
-                    'simulation_stdout': '',
-                    'simulation_stderr': ''
-                }
-
-                if compile_result.returncode != 0:
-                    error_msg = f"Compilation failed: {compile_result.stderr}"
-                    logger.warning(error_msg)
-                    return False, error_msg, results_dict
-
-                results_dict['compile_success'] = True
-
-                # Run simulation with vvp
-                sim_cmd = ["vvp", "test.vvp"]
-                logger.debug(f"Running simulation with: {' '.join(sim_cmd)}")
-
-                sim_result = subprocess.run(
-                    sim_cmd,
-                    cwd=work_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout / 2
-                )
-
-                results_dict['simulation_stdout'] = sim_result.stdout
-                results_dict['simulation_stderr'] = sim_result.stderr
-
-                # Parse simulation output to extract mismatch information
-                # Look for patterns like "Mismatches: X in Y samples"
-                mismatch_pattern = r"Mismatches:\s*(\d+)\s*in\s*(\d+)\s*samples"
-                match = re.search(mismatch_pattern, sim_result.stdout)
-
-                if match:
-                    mismatch_count = int(match.group(1))
-                    total_samples = int(match.group(2))
-                    results_dict['mismatch_count'] = mismatch_count
-                    results_dict['total_samples'] = total_samples
-                    results_dict['simulation_success'] = (mismatch_count == 0)
-
-                    if mismatch_count == 0:
-                        logger.info(f"Simulation passed: 0 mismatches in {total_samples} samples")
-                        return True, "", results_dict
-                    else:
-                        error_msg = f"Simulation failed: {mismatch_count} mismatches in {total_samples} samples"
-                        logger.warning(error_msg)
-                        return False, error_msg, results_dict
-                else:
-                    # Could not parse output
-                    error_msg = "Could not parse simulation results"
-                    logger.warning(f"{error_msg}. Stdout: {sim_result.stdout[:200]}")
-                    return False, error_msg, results_dict
-
-            except subprocess.TimeoutExpired as e:
-                error_msg = f"Timeout after {timeout} seconds"
-                logger.error(error_msg)
-                results_dict = {
-                    'compile_success': False,
-                    'simulation_success': False,
-                    'mismatch_count': -1,
-                    'total_samples': -1,
-                    'compile_stdout': '',
-                    'compile_stderr': error_msg,
-                    'simulation_stdout': '',
-                    'simulation_stderr': ''
-                }
-                return False, error_msg, results_dict
-
-            except Exception as e:
-                error_msg = f"Iverilog test error: {str(e)}"
-                logger.error(error_msg, exc_info=True)
-                results_dict = {
-                    'compile_success': False,
-                    'simulation_success': False,
-                    'mismatch_count': -1,
-                    'total_samples': -1,
-                    'compile_stdout': '',
-                    'compile_stderr': str(e),
-                    'simulation_stdout': '',
-                    'simulation_stderr': ''
-                }
-                return False, error_msg, results_dict
-
-            finally:
-                # Clean up temporary directory
-                if work_dir and os.path.exists(work_dir):
-                    try:
-                        shutil.rmtree(work_dir)
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temp directory {work_dir}: {e}")
-
     RayPyCheckerWorker = _RayPyCheckerWorker
     setattr(get_ray_pychecker_worker_cls, "_cls", RayPyCheckerWorker)
     return RayPyCheckerWorker
 
 
 # Alias for compatibility with the registration system
-def get_ray_docker_worker_cls():
+def get_ray_docker_worker_cls(num_workers=None):
     """Alias for get_ray_pychecker_worker_cls to match the expected interface"""
-    return get_ray_pychecker_worker_cls()
+    return get_ray_pychecker_worker_cls(num_workers=num_workers)
 
-
-async def get_verilog_simulation_result(
-    task_folder: str,
-    circuit_type: str,
-    verilog_dut: str,
-    testbench_json_path: str,
-    timeout: float = 60.0,
-    ray_actor: Any | None = None,
-) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Execute Verilog simulation and return the result.
-    
-    Uses Ray worker for execution with proper timeout handling for concurrent rollouts.
-    
-    Args:
-        task_folder: Task folder containing all artifacts
-        circuit_type: "CMB" or "SEQ"
-        verilog_dut: Verilog DUT code
-        testbench_json_path: Path to testbench.json
-        timeout: Execution timeout in seconds
-        ray_actor: Ray actor for execution
-        
-    Returns:
-        (success, error_message, results_dict) tuple
-        
-    Raises:
-        ValueError: If ray_actor is None
-    """
-    try:
-        if ray_actor is None:
-            raise ValueError("ray_actor is required")
-        
-        # Set buffer to 2x the worker timeout to allow for Ray overhead
-        # This ensures the outer timeout doesn't trigger before worker completes
-        timeout_buffer = max(timeout * 2.0, 120.0)
-        total_timeout = timeout + timeout_buffer
-        
-        # Align call signature with worker's run_verilog_simulation(task_folder, circuit_type, timeout)
-        obj_ref = ray_actor.run_verilog_simulation.remote(
-            task_folder, circuit_type, timeout
-        )
-        result = await _await_ray_object_ref(obj_ref, total_timeout)
-        
-        return result
-        
-    except asyncio.TimeoutError as e:
-        error_msg = f"Verilog simulation timed out after {total_timeout}s"
-        print(f"Error: {error_msg}")
-        return False, error_msg, {}
-    except Exception as e:
-        error_msg = f"Verilog simulation failed: {e}"
-        print(f"Error: {error_msg}")
-        return False, error_msg, {}
 
 
 async def get_stimulus_generation_result(
@@ -754,37 +597,35 @@ async def get_stimulus_generation_result(
 ) -> Tuple[bool, str]:
     """
     Execute stimulus generation and return the result.
-    
+
     Uses Ray worker for execution with proper timeout handling for concurrent rollouts.
-    
+
     Args:
         stimulus_py_path: Path to the stimulus generation Python file
         task_folder: Task folder for execution
         timeout: Execution timeout in seconds
         ray_actor: Ray actor for execution
-        
+
     Returns:
         (success, error_message) tuple
-        
+
     Raises:
         ValueError: If ray_actor is None
     """
     try:
         if ray_actor is None:
             raise ValueError("ray_actor is required")
-        
-        # Set buffer to 2x the worker timeout to allow for Ray overhead
-        # This ensures the outer timeout doesn't trigger before worker completes
-        timeout_buffer = max(timeout * 2.0, 60.0)
+
+        timeout_buffer = max(timeout * 1.5, 30.0)
         total_timeout = timeout + timeout_buffer
-        
+
         obj_ref = ray_actor.run_stimulus_generation.remote(
             stimulus_py_path, task_folder, timeout
         )
         result = await _await_ray_object_ref(obj_ref, total_timeout)
-        
+
         return result
-        
+
     except asyncio.TimeoutError as e:
         error_msg = f"Stimulus generation timed out after {total_timeout}s"
         print(f"Error: {error_msg}")
@@ -793,3 +634,81 @@ async def get_stimulus_generation_result(
         error_msg = f"Stimulus generation failed: {e}"
         print(f"Error: {error_msg}")
         return False, error_msg
+
+
+def cleanup_ray():
+    """
+    Shutdown Ray and clean up temporary directories.
+
+    This function should be called when the program exits or encounters errors.
+    """
+    if not RAY_AVAILABLE:
+        return
+
+    try:
+        import ray
+        if ray.is_initialized():
+            logger.info("Shutting down Ray...")
+            ray.shutdown()
+            logger.info("Ray shut down successfully")
+    except Exception as e:
+        logger.warning(f"Error during Ray shutdown: {e}")
+
+    # Clean up temporary directories
+    try:
+        logger.info("Cleaning up Ray temporary directories...")
+        ray_tmp_dir = "/tmp/verl_ray"
+        ray_spill_dir = "/tmp/verl_spill"
+
+        if os.path.exists(ray_tmp_dir):
+            for item in os.listdir(ray_tmp_dir):
+                if item.startswith("session_"):
+                    session_path = os.path.join(ray_tmp_dir, item)
+                    shutil.rmtree(session_path, ignore_errors=True)
+
+        if os.path.exists(ray_spill_dir):
+            for item in os.listdir(ray_spill_dir):
+                item_path = os.path.join(ray_spill_dir, item)
+                if os.path.isfile(item_path):
+                    os.remove(item_path)
+                elif os.path.isdir(item_path):
+                    shutil.rmtree(item_path, ignore_errors=True)
+
+        logger.info("Ray cleanup completed")
+    except Exception as e:
+        logger.warning(f"Error during Ray cleanup: {e}")
+
+
+# Export PyCheckerWorker as an alias to the Ray worker class
+# This allows direct usage like: PyCheckerWorker.remote(worker_id=0, ...)
+# Note: This will be initialized lazily when first accessed after Ray is initialized
+_PyCheckerWorker = None
+
+class _PyCheckerWorkerProxy:
+    """
+    Proxy class that lazily initializes the Ray worker class.
+    This allows the module to be imported before Ray is initialized.
+    """
+    def __init__(self):
+        self._cls = None
+
+    def _ensure_initialized(self):
+        """Ensure the Ray worker class is initialized"""
+        if self._cls is None:
+            if not RAY_AVAILABLE:
+                raise RuntimeError("Ray is not available. Please install Ray to use PyCheckerWorker.")
+            self._cls = get_ray_pychecker_worker_cls()
+        return self._cls
+
+    def remote(self, *args, **kwargs):
+        """Create a remote instance of the worker"""
+        cls = self._ensure_initialized()
+        return cls.remote(*args, **kwargs)
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the actual Ray worker class"""
+        cls = self._ensure_initialized()
+        return getattr(cls, name)
+
+# Create a proxy instance that will be lazily initialized
+PyCheckerWorker = _PyCheckerWorkerProxy()

@@ -22,33 +22,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pro_v.agent.gen_tb import GenTBAgent
 from pro_v.agent.pychecker import PyCheckerAgent
-from pro_v.agent.verifier import VerifierAgent
 from pro_v.utils.llm_client import (
     create_llm_client_from_config,
     create_pychecker_llm_client_from_config
 )
 
-# Define circuit type mapping
-CMB_TASKS = [1, 2, 3, 4, 5, 9, 11, 16, 17, 18, 19, 20, 22, 23, 26, 29, 30, 34, 35, 37, 38, 39, 
-             41, 44, 45, 47, 48, 49, 50, 51, 53, 54, 57, 58, 61, 62, 64, 65, 67, 68, 70, 71, 73, 
-             81, 82, 83, 84, 85, 87, 90, 91, 95, 96, 100, 101, 102, 108, 109, 111, 112, 113, 114, 
-             115, 116, 117, 119, 121, 123, 124, 125, 128, 130, 131, 132, 134, 135, 136, 138, 139, 
-             140, 143]
-
-SEQ_TASKS = [6, 7, 8, 10, 12, 13, 14, 15, 21, 24, 25, 27, 28, 31, 32, 33, 36, 40, 42, 43, 46, 
-             52, 55, 56, 59, 60, 63, 66, 69, 72, 74, 75, 76, 77, 78, 79, 80, 86, 88, 89, 92, 93, 
-             94, 97, 98, 99, 103, 104, 105, 106, 107, 110, 118, 120, 122, 126, 127, 129, 133, 137, 
-             141, 142, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154]
-
-
-def get_circuit_type(task_number: int) -> str:
-    """Get circuit type based on task number"""
-    if task_number in CMB_TASKS:
+def get_circuit_type(rtl_code: str) -> str:
+    """
+    Determine circuit type by analyzing RTL code.
+    Sequential circuits use clock edges (posedge/negedge).
+    Combinational circuits do not.
+    
+    Args:
+        rtl_code: RTL code to analyze
+        
+    Returns:
+        "seq" if sequential (contains posedge/negedge), "cmb" if combinational
+    """
+    if not rtl_code:
         return "cmb"
-    elif task_number in SEQ_TASKS:
+    
+    rtl_lower = rtl_code.lower()
+    if "posedge" in rtl_lower or "negedge" in rtl_lower:
         return "seq"
     else:
-        return "cmb"  # Default
+        return "cmb"
 
 
 def load_benchmark_data(benchmark_path: str) -> Dict[int, Dict[str, Any]]:
@@ -121,21 +119,41 @@ class TaskWorker:
             model_name=llm_client_config["model"]
         )
 
-        # Initialize the three agents (once per worker)
-        self.gen_tb_agent = GenTBAgent(llm_client=self.llm_client, max_retries=3)
-        self.pychecker_agent = PyCheckerAgent(llm_client=self.pychecker_llm_client, max_retries=3)
-        self.verifier_agent = VerifierAgent(llm_client=self.llm_client, max_retries=3)
+        # Create a dedicated PyChecker worker for this TaskWorker
+        # This worker will be shared by GenTBAgent and PyCheckerAgent
+        from pro_v.tools.pychecker_worker import get_ray_pychecker_worker_cls
 
-        print(f"TaskWorker initialized with 3 agents")
-        print(f"  - GenTB LLM: {llm_client_config['model']} (T={self.llm_client.temperature})")
-        print(f"  - PyChecker LLM: {llm_client_config['model']} (T={self.pychecker_llm_client.temperature})")
-        print(f"  - Verifier LLM: {llm_client_config['model']} (T={self.llm_client.temperature})")
+        PyCheckerWorkerCls = get_ray_pychecker_worker_cls()
+        if PyCheckerWorkerCls:
+            # Create one worker per TaskWorker for Python execution
+            self.pychecker_worker = PyCheckerWorkerCls.remote(worker_id=0)
+            print(f"TaskWorker: Created dedicated PyChecker worker")
+        else:
+            self.pychecker_worker = None
+            print(f"TaskWorker: No PyChecker worker (Ray not available)")
+
+        # Initialize the three agents (once per worker)
+        # Pass the pychecker_worker to agents that need it
+        self.gen_tb_agent = GenTBAgent(
+            llm_client=self.llm_client,
+            max_retries=3,
+            worker=self.pychecker_worker
+        )
+        self.pychecker_agent = PyCheckerAgent(
+            llm_client=self.pychecker_llm_client,
+            max_retries=3,
+            worker=self.pychecker_worker
+        )
+
+        print(f"TaskWorker initialized with 2 agents + PyChecker worker")
+        print(f"  - GenTB Agent: LLM={llm_client_config['model']} (T={self.llm_client.temperature}), Worker={'Yes' if self.pychecker_worker else 'No'}")
+        print(f"  - PyChecker Agent: LLM={llm_client_config['model']} (T={self.pychecker_llm_client.temperature}), Worker={'Yes' if self.pychecker_worker else 'No'}")
         
     def process_task(
         self,
         task_number: int,
         rtl_code: str,
-        specification: str,
+        description: str,
         output_base_dir: str,
         sampling_size: int = 3,
         enable_verification: bool = False,
@@ -149,7 +167,7 @@ class TaskWorker:
         task_{number}/
             ├── task_info.json                   # Task metadata
             ├── module_code.v                    # RTL code
-            ├── specification.txt                # Specification
+            ├── description.txt                # Specification
             ├── header.v                         # Module header
             ├── stimulus.json                    # Generated by GenTBAgent
             ├── golden_dut_0.py                  # Sample 0
@@ -185,11 +203,12 @@ class TaskWorker:
         print(f"Worker processing Task {task_number}")
         print(f"{'='*60}")
 
-        # Determine circuit type
-        circuit_type = get_circuit_type(task_number)
+        # Determine circuit type by analyzing RTL code
+        circuit_type = get_circuit_type(rtl_code)
 
         # Create output directory for this task
-        output_dir = os.path.join(output_base_dir, f"task_{task_number}")
+        # Convert to absolute path to avoid issues with different working directories
+        output_dir = os.path.abspath(os.path.join(output_base_dir, f"task_{task_number}"))
         os.makedirs(output_dir, exist_ok=True)
 
         # Save task metadata and files
@@ -210,9 +229,9 @@ class TaskWorker:
                 f.write(rtl_code)
 
         # Save specification
-        if specification:
-            with open(os.path.join(output_dir, "specification.txt"), "w") as f:
-                f.write(specification)
+        if description:
+            with open(os.path.join(output_dir, "description.txt"), "w") as f:
+                f.write(description)
 
         # Save header
         if header:
@@ -237,8 +256,8 @@ class TaskWorker:
         # Step 1: Run GenTBAgent to generate stimulus.json at task level
         print(f"\nTask {task_number} - Step 1: Running GenTBAgent (circuit_type={circuit_type})")
         gen_tb_result = self.gen_tb_agent.run(
-            rtl_code=rtl_code,
-            specification=specification,
+            description=description,
+            header=header,
             circuit_type=circuit_type,
             output_dir=output_dir
         )
@@ -260,8 +279,8 @@ class TaskWorker:
 
         for sample_idx in range(sampling_size):
             pychecker_result = self.pychecker_agent.run(
-                rtl_code=rtl_code,
-                specification=specification,
+                problem_input=problem_input,
+                description=description,
                 circuit_type=circuit_type,
                 stimulus_json_path=stimulus_json_path,
                 output_dir=output_dir
@@ -817,7 +836,7 @@ class ProVTopAgent:
                 "task_number": task_num,
                 "task_id": task.get("task_id", f"task_{task_num}"),
                 "rtl_code": task.get("module_code", ""),
-                "specification": task.get("description", ""),
+                "description": task.get("description", ""),
                 "header": task.get("header", ""),
                 "mutants": task.get("mutants", [])
             }
@@ -826,7 +845,8 @@ class ProVTopAgent:
         print(f"Successfully prepared {len(tasks_to_process)} tasks for processing")
 
         # Create output directory
-        output_base_dir = f"outputs/{self.args.experiment_name}"
+        # Use absolute path to avoid issues with different working directories
+        output_base_dir = os.path.abspath(f"outputs/{self.args.experiment_name}")
         os.makedirs(output_base_dir, exist_ok=True)
         
         # Create worker pool (limited by max_concurrency)
@@ -845,7 +865,7 @@ class ProVTopAgent:
             task_ref = workers[worker_idx].process_task.remote(
                 task_number=task_data["task_number"],
                 rtl_code=task_data["rtl_code"],
-                specification=task_data["specification"],
+                description=task_data["description"],
                 output_base_dir=output_base_dir,
                 sampling_size=self.args.sampling_size,
                 enable_verification=self.args.enable_verification,
@@ -910,13 +930,14 @@ class ProVTopAgent:
             print(f"SIMULATION METRICS SUMMARY")
             print(f"{'='*70}")
             print(f"Total evaluated:   {simulation_stats['total_evaluated']}")
-            print(f"eval0 (Compile):   {simulation_stats['eval0_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval0_pass_rate']:.1%})")
-            print(f"eval1 (Module):    {simulation_stats['eval1_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval1_pass_rate']:.1%})")
-            print(f"eval2 (Mutants):")
+            print(f"\nCompile & Simulation Results:")
+            print(f"  Compile Success: {simulation_stats['eval0_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval0_pass_rate']:.1%})")
+            print(f"  Simulation Pass: {simulation_stats['eval1_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval1_pass_rate']:.1%})")
+            print(f"\nMutant Detection (eval2):")
             print(f"  80% threshold:   {simulation_stats['eval2_80_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval2_80_pass_rate']:.1%})")
             print(f"  90% threshold:   {simulation_stats['eval2_90_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval2_90_pass_rate']:.1%})")
             print(f"  100% threshold:  {simulation_stats['eval2_100_pass_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['eval2_100_pass_rate']:.1%})")
-            print(f"Overall success:   {simulation_stats['overall_success_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['overall_success_rate']:.1%})")
+            print(f"\nOverall success:   {simulation_stats['overall_success_count']}/{simulation_stats['total_evaluated']} ({simulation_stats['overall_success_rate']:.1%})")
             print(f"{'='*70}\n")
 
         print(f"{'='*70}\n")

@@ -11,6 +11,13 @@ import os
 import subprocess
 from typing import Dict, Any, Optional
 
+try:
+    import ray
+    RAY_AVAILABLE = True
+except ImportError:
+    RAY_AVAILABLE = False
+    ray = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,8 +27,8 @@ logger = logging.getLogger(__name__)
 
 CMB_SYSTEM_PROMPT = """You are an expert in RTL design and Python programming. You can always write correct Python code to verify RTL functionality."""
 
-CMB_GENERATION_PROMPT = r"""
-You are implementing a Python class named "GoldenDUT" that realizes the functionality described in a hardware problem.
+CMB_GENERATION_PROMPT =  r"""
+You are implementing a Python class "GoldenDUT" for combinational logic.
 
 <description>
 {description}
@@ -31,50 +38,15 @@ You are implementing a Python class named "GoldenDUT" that realizes the function
 {module_header}
 </module_header>
 
-## Input/Output Format
+## Requirements
 
+1. Use EXACT signal names from module_header
+2. Bit widths: `[m:n]` → width = m-n+1, no range → 1 bit
+3. Output ONLY '0' and '1' binary strings - NEVER 'X', 'Z', 'd'
+4. Always mask outputs: `result & ((1 << width) - 1)`
+5. Multi-bit format: `format(result, f'0{{{{width}}}}b')`
 
-
-Your GoldenDUT class should:
-1. Initialize any internal state (if needed) in `__init__()`
-2. Implement `load(self, inputs: Dict[str, str]) -> Dict[str, str]` that:
-   - Takes a single test vector (dictionary of input signals)
-   - Returns a dictionary of output signals
-   - All values are binary strings (e.g., "0", "1", "101")
-
-## Implementation Requirements
-
-### 1. Initialization
-```python
-def __init__(self):
-    # Initialize any internal state if needed
-    pass
-```
-
-### 2. Load Method
-```python
-def load(self, inputs: Dict[str, str]) -> Dict[str, str]:
-    # inputs: {"signal_name": "binary_string", ...}
-    # Returns: {"output_name": "binary_string", ...}
-    pass
-```
-
-## Important Notes
-
-1. **Bit indexing**: For signals like `x[4:0]`, the string "11100" maps to:
-   - x[4]=1 (leftmost/MSB)
-   - x[3]=1
-   - x[2]=1
-   - x[1]=0
-   - x[0]=0 (rightmost/LSB)
-
-2. **Output format**: Only return '0' and '1' binary strings. No 'X', 'Z', or other values.
-
-3. **Karnaugh Maps**: If the spec contains K-maps, remember Gray code ordering (00, 01, 11, 10).
-
-## Example
-
-For a simple AND gate (z = a & b):
+## Implementation
 
 ```python
 class GoldenDUT:
@@ -82,278 +54,136 @@ class GoldenDUT:
         pass
     
     def load(self, inputs: Dict[str, str]) -> Dict[str, str]:
-        a = int(inputs["a"])
-        b = int(inputs["b"])
-        z = str(a & b)
-        return {"z": z}
-```
-
-Now implement the GoldenDUT class for the given specification.  Please first think carefully and provide the code of the GoldenDUT class in the format:
-
-```python
-class GoldenDUT:
-    def __init__(self):
-        pass
-    
-    def load(self, inputs: Dict[str, str]) -> Dict[str, str]:
+        # Parse inputs: data = int(inputs["data"], 2)
+        # Return: {{"out": str(result)}} or {{"out": format(result, f'0{{width}}b')}}
         pass
 ```
 
+**REMEMBER**: Output ONLY binary strings with '0' and '1'!
 """
 
 CMB_PythonHeader = """
 import json
+import re
+import random
+import subprocess
+import os
 from typing import Dict, List, Union, Any
-"""
 
+def extract_module_ports_with_yosys(verilog_file="module_code.v"):
+    \"\"\"
+    Use yosys to extract module port information (inputs/outputs with widths).
+    Returns a dict with 'inputs' and 'outputs', each containing {port_name: width}.
+    \"\"\"
+    try:
+        # Create a temporary yosys script
+        yosys_script = f\"\"\"
+read_verilog {verilog_file}
+hierarchy -check
+proc
+opt_clean
+write_json ports.json
+\"\"\"
+        with open("extract_ports.ys", "w") as f:
+            f.write(yosys_script)
 
+        # Run yosys
+        result = subprocess.run(
+            ["yosys", "-s", "extract_ports.ys"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
 
+        if result.returncode != 0:
+            print(f"Yosys extraction failed: {result.stderr}")
+            return None
 
+        # Parse the JSON output
+        with open("ports.json", "r") as f:
+            yosys_data = json.load(f)
 
+        # Extract port information from the first module
+        module_name = list(yosys_data["modules"].keys())[0]
+        module_data = yosys_data["modules"][module_name]
 
-# ============================================================================
-# SEQ (Sequential) Circuit Configuration
-# ============================================================================
+        ports = {"inputs": {}, "outputs": {}}
 
-SEQ_SYSTEM_PROMPT = """You are an expert in RTL design and Python programming. You can always write correct Python code to verify RTL functionality."""
+        for port_name, port_info in module_data["ports"].items():
+            direction = port_info["direction"]
+            bits = port_info["bits"]
+            width = len(bits)
 
-SEQ_GENERATION_PROMPT = r"""
-You are implementing a Python class named "GoldenDUT" that realizes the sequential functionality described in a hardware problem.
+            port_name_lower = port_name.lower()
+            # Skip ONLY clock signals - reset signals should be included!
+            if any(keyword in port_name_lower for keyword in ["clk", "clock"]):
+                continue
 
-<description>
-{description}
-</description>
+            if direction == "input":
+                ports["inputs"][port_name] = width
+            elif direction == "output":
+                ports["outputs"][port_name] = width
 
-<module_header>
-{module_header}
-</module_header>
+        return ports
+    except Exception as e:
+        print(f"Error extracting ports with yosys: {e}")
+        return None
 
-## CRITICAL: Signal Consistency Requirements
+def generate_random_stimulus(ports_info, num_vectors=10):
+    \"\"\"
+    Generate random stimulus based on port information.
+    Returns a list of test vectors (for combinational) or scenarios (for sequential).
+    \"\"\"
+    test_vectors = []
 
-**You MUST use EXACTLY the same signal names as specified in the module_header above.**
+    for _ in range(num_vectors):
+        vector = {}
+        for port_name, width in ports_info["inputs"].items():
+            # Generate random binary string of specified width
+            random_value = random.randint(0, (1 << width) - 1)
+            vector[port_name] = format(random_value, f'0{width}b')
+        test_vectors.append(vector)
 
-- Input signals: Extract from module_header inputs (excluding clock signals like 'clk')
-- Output signals: Extract from module_header outputs
-- DO NOT add extra signals
-- DO NOT omit any signals
-- DO NOT rename signals
+    return test_vectors
 
-## Implementation Requirements
+def verify_and_fix_stimulus(stimulus_data, verilog_file="module_code.v"):
+    \"\"\"
+    Verify stimulus.json matches module ports. If not, generate new stimulus.
+    Returns the verified/corrected stimulus data.
+    \"\"\"
+    # Extract port information using yosys
+    ports_info = extract_module_ports_with_yosys(verilog_file)
 
-### 1. Initialization
-```python
-def __init__(self):
-    # Initialize all state registers to their default values
-    self.state = 0
-    self.counter = 0
-    # etc.
-```
+    if ports_info is None:
+        print("Warning: Could not extract port information with yosys, using original stimulus")
+        return stimulus_data
 
-### 2. Load Method
-```python
-def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-    # clk: 1 = rising edge (0->1), 0 = falling edge (1->0)
-    # inputs: {"signal_name": "binary_string", ...}
-    # Returns: {"output_name": "binary_string", ...}
-    
-    # Handle rising edge and falling edge appropriately
-    # Update state based on inputs and clock edge
-    # Return current outputs
-    pass
-```
+    # Get expected input port names (excluding clock/reset)
+    expected_inputs = set(ports_info["inputs"].keys())
 
-## Clock Edge Behavior
+    if len(stimulus_data) == 0:
+        print("Warning: stimulus.json is empty, generating random stimulus")
+        return generate_random_stimulus(ports_info)
 
-The `load` method will be called **TWICE per clock cycle**:
+    # Check if stimulus keys match expected inputs
+    actual_inputs = set(stimulus_data[0].keys()) - {"clock_cycles"}  # For sequential circuits
 
-1. **Rising Edge** (clk=1): Called when clock transitions from 0 to 1
-   - This is where most sequential logic updates state (e.g., flip-flops capture inputs)
-   
-2. **Falling Edge** (clk=0): Called when clock transitions from 1 to 0
-   - Some designs may have falling-edge triggered logic
-   - Most designs only update on rising edge
+    if expected_inputs != actual_inputs:
+        print(f"Mismatch detected!")
+        print(f"Expected inputs from module: {sorted(expected_inputs)}")
+        print(f"Actual inputs from stimulus.json: {sorted(actual_inputs)}")
+        print(f"Generating new random stimulus based on module ports...")
 
-**Asynchronous Reset (check OUTSIDE clock edge):**
-```python
-def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-    aresetn = int(inputs["aresetn"], 2)
-    
-    # Asynchronous reset - check regardless of clock
-    if aresetn == 0:  # active low
-        self.state = 0
-        self.output = 0
+        return generate_random_stimulus(ports_info, num_vectors=len(stimulus_data))
     else:
-        # Normal operation on clock edge
-        if clk == 1:
-            # state transitions
-            pass
-    
-    return {"output": str(self.output)}
-```
-
-**Synchronous Reset (check INSIDE clock edge):**
-```python
-def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-    reset = int(inputs["reset"], 2)
-    
-    # Synchronous reset - only check on clock edge
-    if clk == 1:
-        if reset == 1:  # active high
-            self.state = 0
-            self.output = 0
-        else:
-            # state transitions
-            pass
-    
-    return {"output": str(self.output)}
-```
-
-### Mealy Machine (Output depends on BOTH current state AND current input)
-
-**CRITICAL DIFFERENCES:**
-- Output is combinational logic, NOT a register
-- Output must be calculated based on CURRENT state (before transition) and CURRENT input
-- Output can change immediately when input changes, without waiting for clock edge
-- **NEVER store Mealy output in a register - calculate it each time**
-
-**Example - Mealy FSM detecting "101" sequence:**
-```python
-class GoldenDUT:
-    def __init__(self):
-        self.state = 0  # States: 0=S0, 1=S1, 2=S10
-        # NO self.z register! Output is combinational for Mealy
-    
-    def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-        aresetn = int(inputs["aresetn"], 2)
-        x = int(inputs["x"], 2)
-        
-        # Asynchronous reset
-        if aresetn == 0:
-            self.state = 0
-        elif clk == 1:
-            # State transitions based on CURRENT state and input
-            current_state = self.state
-            if current_state == 0:
-                self.state = 1 if x == 1 else 0
-            elif current_state == 1:
-                self.state = 1 if x == 1 else 2
-            elif current_state == 2:
-                self.state = 1 if x == 1 else 0
-        
-        # MEALY OUTPUT: Calculate based on CURRENT state and CURRENT input
-        # Do NOT use self.state directly after update - save current_state first
-        current_state = self.state
-        z_output = 0
-        if current_state == 2 and x == 1:  # In S10 state with input 1
-            z_output = 1
-        
-        return {"z": str(z_output)}
-```
-
-**Common MISTAKE for Mealy machines:**
-```python
-# WRONG - Don't do this for Mealy!
-if clk == 1:
-    # ... state transitions ...
-    self.z = 1 if (self.state == 2 and x == 1) else 0  # WRONG: storing in register
-
-return {"z": str(self.z)}  # WRONG: output is registered
-```
-
-## State Machine Completeness
-
-
-## Output Timing for State Machines
-
-**When does output become valid?**
-
-Read the description carefully:
-- "Output is valid when done=1" means output only matters when done signal is high
-- "Output immediately after third byte received" means output appears same cycle as state transition
-- "Output on next cycle" means register the output for one cycle delay
-
-**Example with conditional output:**
-```python
-# Output valid only when done=1, otherwise don't care
-def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-    # ... state transitions ...
-    
-    if clk == 1:
-        if self.state == 3:
-            self.done = 1
-            self.out_bytes = (self.byte1 << 16) | (self.byte2 << 8) | self.byte3
-        else:
-            self.done = 0
-            # out_bytes doesn't matter when done=0
-    
-    # Return current values
-    return {
-        "done": str(self.done),
-        "out_bytes": format(self.out_bytes, '024b') if self.done else '0'*24
-    }
-```
-
-## CRITICAL: Signal Bit Width and Formatting
-
-**Always check module_header for exact bit widths!**
-
-From module_header, you can determine bit widths:
-- `input [7:0] data` means 8 bits (from bit 7 to bit 0)
-- `input x` means 1 bit
-- `output [23:0] out_bytes` means 24 bits
-- `output reg [15:0] counter` means 16 bits
-
-### Reading Input Signals
-
-**CORRECT way to read inputs:**
-```python
-# For multi-bit signal [7:0] in
-in_val = int(inputs["in"], 2)  # "10110011" -> 179
-
-# For single-bit signal x
-x = int(inputs["x"], 2)  # "1" -> 1 or "0" -> 0
-
-# Extract specific bit (e.g., bit 3 of in[7:0])
-bit3 = (in_val >> 3) & 0x1  # Shift right 3 bits and mask
-```
-
-**NOTE: Verilog vs Python bit indexing:**
-- **Verilog `[7:0]`**: Bit 7 = MSB (leftmost), Bit 0 = LSB (rightmost)
-- **Python**: Use right-shift to access specific bit position
-- To access **Verilog bit N**: use `(value >> N) & 0x1`
-
-Example:
-```
-Verilog: in = 8'b10110011, in[3] accesses bit 3
-         Bit [7][6][5][4][3][2][1][0]
-             [ 1][ 0][ 1][ 1][ 0][ 0][ 1][ 1]
-                            ^
-                         bit 3 = 0
-                         
-Python:  in_val = 0b10110011 = 179
-         (179 >> 3) & 0x1 = 0b00010110 & 1 = 0  ✓ Correct!
-```
-
-
-Now implement the GoldenDUT class for the given specification. 
-
-Please think carefully and provide the code of the GoldenDUT class in the format:
-
-```python
-class GoldenDUT:
-    def __init__(self):
-        pass
-    
-    def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
-        pass
-```
+        print(f"Stimulus verification passed. All ports match: {sorted(expected_inputs)}")
+        return stimulus_data
 """
 
-SEQ_PythonHeader = """
-import json
-from typing import Dict, List, Union
 
-"""
+
+
+
 CMB_CHECKER_TAIL = """
 if __name__ == "__main__":
     import os
@@ -366,8 +196,14 @@ if __name__ == "__main__":
         print(f"Files in current directory: {os.listdir('.')}")
         sys.exit(1)
 
+    # Load stimulus.json
     with open("stimulus.json", "r") as f:
         test_vectors = json.load(f)
+
+    # Verify and fix stimulus if needed (using yosys)
+    print("\\n=== Verifying stimulus against module ports ===")
+    test_vectors = verify_and_fix_stimulus(test_vectors, verilog_file="module_code.v")
+    print("==============================================\\n")
 
     dut = GoldenDUT()
     testbench = []
@@ -391,7 +227,6 @@ if __name__ == "__main__":
 
     print("Testbench generation successful")
 """
-
 SEQ_CHECKER_TAIL = """
 if __name__ == "__main__":
     import os
@@ -404,8 +239,14 @@ if __name__ == "__main__":
         print(f"Files in current directory: {os.listdir('.')}")
         sys.exit(1)
 
+    # Load stimulus.json
     with open("stimulus.json", "r") as f:
         test_scenarios = json.load(f)
+
+    # Verify and fix stimulus if needed (using yosys)
+    print("\\n=== Verifying stimulus against module ports ===")
+    test_scenarios = verify_and_fix_stimulus_seq(test_scenarios, verilog_file="module_code.v")
+    print("==============================================\\n")
 
     testbench = []
 
@@ -448,6 +289,271 @@ if __name__ == "__main__":
     print("Testbench generation successful")
 """
 
+
+# ============================================================================
+# SEQ (Sequential) Circuit Configuration
+# ============================================================================
+
+SEQ_SYSTEM_PROMPT = """You are an expert in RTL design and Python programming. You can always write correct Python code to verify RTL functionality."""
+
+SEQ_GENERATION_PROMPT = r"""
+
+You are implementing a Python class "GoldenDUT" for sequential logic.
+
+<description>
+{description}
+</description>
+
+<module_header>
+{module_header}
+</module_header>
+
+## CRITICAL REQUIREMENTS
+
+**1. EXACT Signal Names from module_header**:
+   - Use ONLY the signal names that appear in module_header (exclude 'clk')
+   - ✓ CORRECT: If module has "reset", use inputs["reset"]
+   - ✓ CORRECT: If module has "areset", use inputs["areset"]
+   - ✓ CORRECT: If module has "resetn", use inputs["resetn"]
+   - ❌ WRONG: If module has "reset", do NOT use inputs["rst"] or inputs["areset"]
+   - Do NOT access signals that don't exist in module_header
+
+**2. Input/Output Signal Handling**:
+   - inputs parameter contains INPUT signals (excluding 'clk')
+   - Return dict should contain ONLY OUTPUT signals
+   - Do NOT include input signals in return dict
+
+**3. Bit Widths and Format**:
+   - `[m:n]` → width = m-n+1, no range → 1 bit
+   - Output ONLY '0' and '1' binary strings - NEVER 'X', 'Z', 'd'
+   - Always mask outputs: `result & ((1 << width) - 1)`
+   - Multi-bit format: `format(result, f'0{{{{width}}}}b')`
+
+**4. State Updates**:
+   - Update state ONLY when `clk == 1` (rising edge)
+   - Initialize all state variables to 0 in __init__
+
+## Implementation Template
+
+```python
+class GoldenDUT:
+    def __init__(self):
+        # Initialize state variables to 0
+        pass
+
+    def load(self, clk: int, inputs: Dict[str, str]) -> Dict[str, str]:
+        # Parse inputs using EXACT signal names from module_header
+        # Example: reset = int(inputs["reset"], 2)  # Use actual name!
+
+        # Update state on clk == 1 (rising edge)
+
+        # Return outputs as binary strings
+        # Example: return {{"out": format(result, f'0{{width}}b')}}
+        pass
+```
+
+**REMEMBER**:
+- Use EXACT signal names from module_header
+- Output ONLY binary strings with '0' and '1'
+- Access inputs dict with correct key names
+"""
+
+SEQ_PythonHeader = """
+import json
+import re
+import random
+import subprocess
+import os
+from typing import Dict, List, Union
+
+def extract_module_ports_with_yosys(verilog_file="module_code.v"):
+    \"\"\"
+    Use yosys to extract module port information (inputs/outputs with widths).
+    Returns a dict with 'inputs' and 'outputs', each containing {port_name: width}.
+    \"\"\"
+    try:
+        # Create a temporary yosys script
+        yosys_script = f\"\"\"
+read_verilog {verilog_file}
+hierarchy -check
+proc
+opt_clean
+write_json ports.json
+\"\"\"
+        with open("extract_ports.ys", "w") as f:
+            f.write(yosys_script)
+
+        # Run yosys
+        result = subprocess.run(
+            ["yosys", "-s", "extract_ports.ys"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"Yosys extraction failed: {result.stderr}")
+            return None
+
+        # Parse the JSON output
+        with open("ports.json", "r") as f:
+            yosys_data = json.load(f)
+
+        # Extract port information from the first module
+        module_name = list(yosys_data["modules"].keys())[0]
+        module_data = yosys_data["modules"][module_name]
+
+        ports = {"inputs": {}, "outputs": {}}
+
+        for port_name, port_info in module_data["ports"].items():
+            direction = port_info["direction"]
+            bits = port_info["bits"]
+            width = len(bits)
+
+            port_name_lower = port_name.lower()
+            # Skip ONLY clock signals - reset signals should be included!
+            if any(keyword in port_name_lower for keyword in ["clk", "clock"]):
+                continue
+
+            if direction == "input":
+                ports["inputs"][port_name] = width
+            elif direction == "output":
+                ports["outputs"][port_name] = width
+
+        return ports
+    except Exception as e:
+        print(f"Error extracting ports with yosys: {e}")
+        return None
+
+def generate_random_stimulus_seq(ports_info, num_scenarios=5, cycles_per_scenario=10):
+    \"\"\"
+    Generate random stimulus scenarios for sequential circuits.
+    Returns a list of scenarios with clock_cycles and input sequences.
+    \"\"\"
+    scenarios = []
+
+    for _ in range(num_scenarios):
+        scenario = {"clock_cycles": cycles_per_scenario}
+
+        for port_name, width in ports_info["inputs"].items():
+            # Generate random sequence for this input
+            sequence = []
+            for _ in range(cycles_per_scenario):
+                random_value = random.randint(0, (1 << width) - 1)
+                sequence.append(format(random_value, f'0{width}b'))
+            scenario[port_name] = sequence
+
+        scenarios.append(scenario)
+
+    return scenarios
+
+def verify_and_fix_stimulus_seq(stimulus_data, verilog_file="module_code.v"):
+    \"\"\"
+    Verify stimulus.json matches module ports for sequential circuits.
+    If not, generate new stimulus.
+    Returns the verified/corrected stimulus data.
+    \"\"\"
+    # Flatten nested lists (handle cases where stimulus_gen returns nested structures)
+    if isinstance(stimulus_data, list):
+        flattened_data = []
+        for item in stimulus_data:
+            if isinstance(item, list):
+                # If item is a list, extend (flatten) it into the main list
+                flattened_data.extend(item)
+            else:
+                # If item is not a list, append it directly
+                flattened_data.append(item)
+        stimulus_data = flattened_data
+
+    # Extract port information using yosys
+    ports_info = extract_module_ports_with_yosys(verilog_file)
+
+    if ports_info is None:
+        print("Warning: Could not extract port information with yosys, using original stimulus")
+        return stimulus_data
+
+    # Get expected input port names (excluding clock/reset)
+    expected_inputs = set(ports_info["inputs"].keys())
+
+    if len(stimulus_data) == 0:
+        print("Warning: stimulus.json is empty, generating random stimulus")
+        return generate_random_stimulus_seq(ports_info)
+
+    # Infer clock_cycles for scenarios missing it
+    for idx, scenario in enumerate(stimulus_data):
+        if not isinstance(scenario, dict):
+            continue
+        if "clock_cycles" not in scenario:
+            # Check if all values are single strings (single cycle) or lists (multi-cycle)
+            has_lists = any(isinstance(v, list) for k, v in scenario.items() if k != "clock_cycles")
+            if has_lists:
+                # If any value is a list, infer clock_cycles from the longest list
+                max_len = max((len(v) if isinstance(v, list) else 1) for v in scenario.values())
+                scenario["clock_cycles"] = max_len
+                print(f"Warning: Scenario {idx} missing 'clock_cycles', inferred as {max_len} from signal lengths")
+            else:
+                # All values are single strings, so it's a single cycle test
+                scenario["clock_cycles"] = 1
+                print(f"Warning: Scenario {idx} missing 'clock_cycles', inferred as 1 (single cycle)")
+
+    # Check if stimulus keys match expected inputs
+    # Skip scenarios that are not dicts
+    valid_scenarios = [s for s in stimulus_data if isinstance(s, dict)]
+    if not valid_scenarios:
+        print("Warning: No valid scenarios after flattening, generating random stimulus")
+        return generate_random_stimulus_seq(ports_info)
+
+    actual_inputs = set(valid_scenarios[0].keys()) - {"clock_cycles"}
+
+    # Check if we have at least some overlap with expected inputs
+    # Don't require exact match - allow extra signals (will be filtered) or missing signals
+    overlap = actual_inputs & expected_inputs
+
+    if not overlap and expected_inputs:
+        # Only regenerate if there's ZERO overlap with expected inputs
+        print(f"Critical mismatch detected!")
+        print(f"Expected inputs from module: {sorted(expected_inputs)}")
+        print(f"Actual inputs from stimulus.json: {sorted(actual_inputs)}")
+        print(f"No overlap found - Generating new random stimulus based on module ports...")
+
+        # Determine average cycles from original stimulus
+        avg_cycles = sum(s.get("clock_cycles", 10) for s in stimulus_data) // len(stimulus_data)
+        return generate_random_stimulus_seq(ports_info, num_scenarios=len(stimulus_data), cycles_per_scenario=avg_cycles)
+    elif expected_inputs != actual_inputs:
+        # Partial mismatch - filter out extra signals, keep the ones that match
+        print(f"Partial mismatch detected:")
+        print(f"Expected inputs from module: {sorted(expected_inputs)}")
+        print(f"Actual inputs from stimulus.json: {sorted(actual_inputs)}")
+
+        extra_signals = actual_inputs - expected_inputs
+        missing_signals = expected_inputs - actual_inputs
+
+        if extra_signals:
+            print(f"Extra signals (will be filtered): {sorted(extra_signals)}")
+        if missing_signals:
+            print(f"Missing signals (will NOT be auto-added): {sorted(missing_signals)}")
+
+        # Filter stimulus to only keep valid signals
+        filtered_data = []
+        for scenario in stimulus_data:
+            if not isinstance(scenario, dict):
+                continue
+            filtered_scenario = {"clock_cycles": scenario.get("clock_cycles", 1)}
+            for sig in expected_inputs:
+                if sig in scenario:
+                    filtered_scenario[sig] = scenario[sig]
+            filtered_data.append(filtered_scenario)
+
+        print(f"Filtered stimulus to keep only valid signals: {sorted(expected_inputs & actual_inputs)}")
+        return filtered_data
+    else:
+        print(f"Stimulus verification passed. All ports match: {sorted(expected_inputs)}")
+        return stimulus_data
+
+"""
+# =============================================================================
+
+
 PythonHeader = """
 import json
 from typing import Dict, List, Union
@@ -460,21 +566,23 @@ class PyCheckerAgent:
     Simplified architecture: only __init__ and run
     """
     
-    def __init__(self, llm_client=None, max_retries: int = 3):
+    def __init__(self, llm_client=None, max_retries: int = 3, worker=None):
         """Initialize the PyChecker Agent
         
         Args:
             llm_client: LLM client for making API calls
             max_retries: Maximum number of retries on failure
+            worker: Ray worker actor for executing Python code (optional)
         """
         self.llm_client = llm_client
         self.max_retries = max_retries
-        logger.info(f"PyCheckerAgent initialized with max_retries={max_retries}")
+        self.worker = worker
+        logger.info(f"PyCheckerAgent initialized with max_retries={max_retries}, worker={'provided' if worker else 'None'}")
         
     def run(
         self,
-        rtl_code: str,
-        specification: str,
+        description: str,
+        header: str,
         circuit_type: str,
         stimulus_json_path: str,
         output_dir: str
@@ -520,27 +628,18 @@ class PyCheckerAgent:
             try:
                 # Step 1: Extract module header from RTL code
                 # The module header is typically the first few lines before the module body
-                module_header = ""
-                if rtl_code:
-                    lines = rtl_code.split('\n')
-                    for i, line in enumerate(lines):
-                        module_header += line + '\n'
-                        if ');' in line or (i > 0 and ');' in lines[i-1]):
-                            break
-                    module_header = module_header.strip()
-
-                # Step 2: Prepare prompt based on circuit type
+                
                 if circuit_type.lower() == "seq":
                     system_prompt = SEQ_SYSTEM_PROMPT
                     user_prompt = SEQ_GENERATION_PROMPT.format(
-                        description=specification,
-                        module_header=module_header
+                        description=description,
+                        module_header=header
                     )
                 else:  # cmb
                     system_prompt = CMB_SYSTEM_PROMPT
                     user_prompt = CMB_GENERATION_PROMPT.format(
-                        description=specification,
-                        module_header=module_header
+                        description=description,
+                        module_header=header
                     )
 
                 # For retry attempts, append previous code and error information
@@ -577,6 +676,15 @@ class PyCheckerAgent:
                 # Store current code for potential retry
                 previous_code = python_code
 
+                # Validate Python syntax before saving
+                logger.info(f"Validating Python syntax for attempt {attempt + 1}")
+                syntax_error = self._validate_python_syntax(complete_code)
+                if syntax_error:
+                    error_msg = f"Python syntax error:\n{syntax_error}"
+                    logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                    previous_error = error_msg
+                    continue
+
                 # Step 5: Save Python code to file
                 golden_dut_path = os.path.join(output_dir, "golden_dut.py")
 
@@ -585,19 +693,47 @@ class PyCheckerAgent:
 
                 # Step 6: Execute Python code to generate testbench.json
                 logger.info(f"Executing Python code: {golden_dut_path}")
-                result = subprocess.run(
-                    ["python", "golden_dut.py"],
-                    cwd=output_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
+                
+                if self.worker is not None:
+                    # Use Ray worker for execution
+                    try:
+                        if RAY_AVAILABLE:
+                            # Increased timeouts to handle complex golden DUT execution
+                            # Worker timeout: 120s for execution
+                            # Ray.get timeout: 300s (5 min) to allow for Ray overhead and queueing
+                            obj_ref = self.worker.run_python_file.remote(
+                                python_file_path="golden_dut.py",
+                                working_directory=output_dir,
+                                timeout=120.0
+                            )
+                            success, error_msg = ray.get(obj_ref, timeout=300.0)
+                            
+                            if not success:
+                                logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                                previous_error = error_msg
+                                continue
+                        else:
+                            raise RuntimeError("Ray is not available but worker was provided")
+                    except Exception as e:
+                        error_msg = f"Worker execution error: {str(e)}"
+                        logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                        previous_error = error_msg
+                        continue
+                else:
+                    # Fallback to subprocess if no worker provided
+                    result = subprocess.run(
+                        ["python", "golden_dut.py"],
+                        cwd=output_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=60
+                    )
 
-                if result.returncode != 0:
-                    error_msg = f"Python execution error:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
-                    logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
-                    previous_error = error_msg
-                    continue
+                    if result.returncode != 0:
+                        error_msg = f"Python execution error:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
+                        logger.warning(f"Attempt {attempt + 1} failed: {error_msg}")
+                        previous_error = error_msg
+                        continue
 
                 # Step 7: Check if testbench.json was created
                 testbench_json_path = os.path.join(output_dir, "testbench.json")
@@ -697,20 +833,51 @@ if __name__ == "__main__":
         """
         import re
         
+        # Strip out reasoning tags like <think> ... </think> that some LLMs emit
+        cleaned_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+        cleaned_response = re.sub(r'</?think>', '', cleaned_response)
+        
         # Try to find ```python ... ``` blocks
         pattern = r'```python\s*(.*?)\s*```'
-        matches = re.findall(pattern, response, re.DOTALL)
+        matches = re.findall(pattern, cleaned_response, re.DOTALL)
         
         if matches:
             return matches[0].strip()
         
         # Try to find ``` ... ``` blocks
         pattern = r'```\s*(.*?)\s*```'
-        matches = re.findall(pattern, response, re.DOTALL)
+        matches = re.findall(pattern, cleaned_response, re.DOTALL)
         
         if matches:
             return matches[0].strip()
         
+        # If no fenced code, try to capture from the first class/def definition
+        class_idx = cleaned_response.find("class ")
+        if class_idx != -1:
+            return cleaned_response[class_idx:].strip()
+        def_idx = cleaned_response.find("def ")
+        if def_idx != -1:
+            return cleaned_response[def_idx:].strip()
+        
         # If no code blocks found, return the whole response
         logger.warning("No code blocks found in response, using entire response")
-        return response.strip()
+        return cleaned_response.strip()
+    
+    def _validate_python_syntax(self, code: str) -> Optional[str]:
+        """Validate Python code syntax
+        
+        Args:
+            code: Python code string
+            
+        Returns:
+            Error message if syntax is invalid, None if valid
+        """
+        import ast
+        
+        try:
+            ast.parse(code)
+            return None
+        except SyntaxError as e:
+            return f"SyntaxError: {e.msg} at line {e.lineno}, column {e.offset}\n{e.text}"
+        except Exception as e:
+            return f"Parse error: {str(e)}"

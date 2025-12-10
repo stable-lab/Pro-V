@@ -6,14 +6,14 @@ set -Eeuo pipefail
 ########################################
 # Visible GPUs in the order you want to consume them (comma-separated, no spaces)
 # Example for 8 GPUs: "0,1,2,3,4,5,6,7"
-GPU_IDS="2,3"
+GPU_IDS="0,1,2,3"
 
 # Model weights path (local dir or HF repo ID)
-MODEL_PATH="/home/lah003/models/Qwen3-8B"
+MODEL_PATH="Your local model path"
 
 # Served model name for the OpenAI-compatible server (defaults to basename of MODEL_PATH if empty)
-SERVED_MODEL_NAME="Qwen/Qwen3-8B"
-EXPERIMENT_NAME="fine_thinking_8B"
+SERVED_MODEL_NAME="Your served model name"
+EXPERIMENT_NAME="Your experiment name"
 # vLLM max context length
 MAX_LEN=36000
 
@@ -21,7 +21,7 @@ MAX_LEN=36000
 PORT=8020
 
 # Parallelism knobs
-TP_SIZE=2          # tensor-parallel per replica
+TP_SIZE=4          # tensor-parallel per replica
 DP_SIZE=1          # number of replicas (data-parallel); total GPUs used = TP_SIZE * DP_SIZE
 
 # Optional: extra vLLM flags, e.g. '--gpu-memory-utilization 0.95 --dtype auto'
@@ -174,14 +174,14 @@ launch_replica() {
 }
 
 try_link_or_launch() {
-  # Enforce: try to link within 10s; if not available and port free => launch and wait 120s
+  # Enforce: try to link within 3s; if not available and port free => launch and wait 120s
   # If port occupied by non-vLLM, error and exit.
   local idx="$1"
   local port="$2"
   local cuda="$3"
 
-  echo "[INFO] Probing port :${port} for an existing vLLM/OpenAI server (10s)..."
-  if wait_for_ready "${port}" 10; then
+  echo "[INFO] Probing port :${port} for an existing vLLM/OpenAI server (3s retry)..."
+  if wait_for_ready "${port}" 3; then
     local name
     name="$(get_remote_model_name "${port}" || true)"
     if [[ -n "${name}" ]]; then
@@ -197,13 +197,13 @@ try_link_or_launch() {
     return 0
   fi
 
-  # Not ready within 10s; check if port is free to launch our own
+  # Not ready within 3s; check if port is free to launch our own
   if lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "[ERROR] Port ${port} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
     exit 1
   fi
 
-  echo "[INFO] No server detected on :${port} within 10s. Launching our vLLM and waiting up to 120s..."
+  echo "[INFO] No server detected on :${port} within 3s. Launching our vLLM and waiting up to 120s..."
   launch_replica "${idx}" "${port}" "${cuda}"
   if ! wait_for_ready "${port}" 120; then
     echo "[ERROR] vLLM on port ${port} did not become ready in 120s. Check logs: ${STARTED_LOGS[-1]}." >&2
@@ -242,7 +242,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM ERR
 
-# DP orchestration: apply "link in 10s else launch & wait 120s" to each replica port
+# DP orchestration: apply "link in 3s else launch & wait 120s" to each replica port
 if (( DP_SIZE == 1 )); then
   try_link_or_launch 0 "${PORT}" "${replica_cuda_devices[0]}"
 else
@@ -251,9 +251,9 @@ else
   for (( i=0; i<DP_SIZE; i++ )); do
     rport=$(( PORT + i ))
     cuda="${replica_cuda_devices[$i]}"
-    
-    echo "[INFO] Probing port :${rport} for an existing vLLM/OpenAI server (10s)..."
-    if wait_for_ready "${rport}" 10; then
+
+    echo "[INFO] Probing port :${rport} for an existing vLLM/OpenAI server (3s retry)..."
+    if wait_for_ready "${rport}" 3; then
       name="$(get_remote_model_name "${rport}" || true)"
       if [[ -n "${name}" ]]; then
         echo "[INFO] Reusing running server on :${rport} serving '${name}'."
@@ -266,12 +266,12 @@ else
       STARTED_PORTS+=("${rport}")
       STARTED_FLAGS+=("existing")
     else
-      # Not ready within 10s; check if port is free to launch our own
+      # Not ready within 3s; check if port is free to launch our own
       if lsof -iTCP:"${rport}" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "[ERROR] Port ${rport} is occupied by a non-responsive or non-vLLM service. Stop it or change PORT." >&2
         exit 1
       fi
-      
+
       echo "[INFO] No server detected on :${rport}. Launching vLLM replica #${i} in background..."
       launch_replica "${i}" "${rport}" "${cuda}"
     fi
@@ -341,4 +341,29 @@ ${PY} pro_v/prompting_top_agent_ray.py \
   ${EXTRA_ARGS}
 set +x
 
-echo "[INFO] Evaluation finished."
+echo "[INFO] Main evaluation finished."
+
+# ---------------------------------
+# Run evaluate2 - Mutant Detection Analysis
+# ---------------------------------
+echo "[INFO] Starting evaluate2 - Mutant detection analysis..."
+
+# Determine output report filename based on experiment name
+EVAL2_REPORT_FILE="evaluation_report_${EXPERIMENT_NAME}_${DAY}.json"
+
+# Experiment outputs directory
+EXPERIMENT_OUTPUT_DIR="outputs/${EXPERIMENT_NAME}"
+
+echo "[INFO] Running mutant detection evaluation on generated testbenches..."
+echo "[INFO] Using experiment outputs from: ${EXPERIMENT_OUTPUT_DIR}"
+set -x
+${PY} pro_v/simulate_and_evaluate_mutants.py \
+  "${FOLDER_PATH}" \
+  --output "${EVAL2_REPORT_FILE}" \
+  --experiment_dir "${EXPERIMENT_OUTPUT_DIR}" \
+  ${TASK_NUMBERS:+--start 0} \
+  ${TASK_NUMBERS:+--limit $(echo "$TASK_NUMBERS" | tr ',' '\n' | wc -l)}
+set +x
+
+echo "[INFO] Mutant detection evaluation completed. Report saved to: ${EVAL2_REPORT_FILE}"
+echo "[INFO] All evaluations finished."

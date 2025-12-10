@@ -1,10 +1,11 @@
 module top_module (
-	input [99:0] a,
-	input [99:0] b,
 	input sel,
-	output [99:0] out
+	input [7:0] a,
+	input [7:0] b,
+	output reg [7:0] out
 );
 
-	assign out = sel ? b : a;
+	// assign out = (~sel & a) | (sel & b);
+    assign out = sel ? a : b;
 	
 endmodule

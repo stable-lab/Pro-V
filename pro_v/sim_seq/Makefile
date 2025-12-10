@@ -32,9 +32,15 @@ VERILATOR_COVERAGE = $(VERILATOR_ROOT)/bin/verilator_coverage
 endif
 
 # Generate C++ in executable form
-VERILATOR_FLAGS = -cc --exe -x-assign fast -Wall --assert --coverage-line \
+VERILATOR_FLAGS = -cc --exe -x-assign fast -Wno-fatal --assert --coverage-line \
                  -Wno-WIDTHEXPAND -Wno-BLKSEQ -Wno-VARHIDDEN \
-                 -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL
+                 -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-CASEOVERLAP \
+                 -Wno-BLKANDNBLK -Wno-COMBDLY -Wno-UNUSEDPARAM \
+                 -Wno-PROCASSINIT -Wno-ASCRANGE -Wno-LATCH \
+                 -Wno-UNDRIVEN -Wno-UNUSEDGENVAR -Wno-PINMISSING \
+                 -Wno-IMPLICIT -Wno-DECLFILENAME -Wno-UNSIGNED \
+                 -Wno-CASEINCOMPLETE -Wno-UNOPTFLAT -Wno-MULTIDRIVEN \
+                 -CFLAGS -faligned-new -CFLAGS -Wno-sign-compare -CFLAGS -Wno-overflow
 
 # Input files for Verilator
 VERILATOR_INPUT = -f input.vc top_module.v sim-main.cpp rfuzz-harness.cpp
