@@ -124,27 +124,8 @@ conda activate pro-v
 pip install -e .
 ```
 
-### 2.> Set API Keys (Optional)
 
-If you want to use commercial LLM APIs for comparison, set up your API keys:
-
-**Option 1: Environment Variables**
-```bash
-export OPENAI_API_KEY='your-openai-key'
-export ANTHROPIC_API_KEY='your-anthropic-key'
-```
-
-**Option 2: Configuration File**
-
-Create a `key.cfg` file in the root directory:
-```
-OPENAI_API_KEY='your-openai-key'
-ANTHROPIC_API_KEY='your-anthropic-key'
-VERTEX_SERVICE_ACCOUNT_PATH='path-to-service-account'
-VERTEX_REGION='your-region'
-```
-
-### 3.> Install Icarus Verilog (v12)
+### 2.> Install Icarus Verilog (v12)
 
 **Ubuntu (Local Compilation)**
 ```bash
@@ -173,7 +154,7 @@ Expected output (first line):
 Icarus Verilog version 12.0 (stable) (v12_0)
 ```
 
-### 4.> Install Verilator
+### 3.> Install Verilator
 
 ```bash
 # By apt (Ubuntu/Debian)
@@ -191,25 +172,6 @@ export VERILATOR_ROOT=`pwd`
 make -j4
 ```
 
-### 5.> Install Pyverilog
-
-```bash
-# Install prerequisites
-
-
-# Install Pyverilog
-git clone https://github.com/PyHDI/Pyverilog.git
-cd Pyverilog
-python3 setup.py install --user
-```
-
-### 6.> Download Benchmarks
-
-The repository uses [VerilogEval](https://github.com/NVlabs/verilog-eval) benchmarks as submodules:
-
-```bash
-git submodule update --init --recursive
-```
 
 ## 📖 Usage
 
